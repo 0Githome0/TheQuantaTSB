@@ -1,0 +1,46 @@
+{
+    "mt5_details": {
+        "login": 242426005,
+        "password": "37YKrUZkEJKWDU$",
+        "server": "Exness-MT5Real",
+        "path": "C:\\Program Files\\MetaTrader 5 EXNESS\\terminal64.exe",
+        "auto_connect_mt5": true
+    },
+    "trading_pairs": [
+        "EURUSDm",
+        "XAUUSDm",
+        "BTCUSDm",
+        "GBPUSDm",
+        "USDJPYm"
+    ],
+    "timeframes": [
+        "M15",
+        "H1"
+    ],
+    "bot_settings": {
+        "loop_sleep_seconds": 60,
+        "summary_interval_minutes": 30,
+        "data_fetch_count": 200,
+        "signal_display_limit": 20
+    },
+    "logging": {
+        "level": "INFO"
+    },
+    "performance_tracker": {
+        "history_file": "data/trade_history.csv"
+    },
+    "profitability_enhancer": {
+        "enable_adaptation_check": true
+    },
+    "execution_manager": {
+        "max_daily_trades": 10,
+        "max_concurrent_trades": 3,
+        "allowed_slippage_pips": 3,
+        "order_magic_number": 12345,
+        "risk_per_trade_pct": 1.0,
+        "min_lot": 0.01,
+        "max_lot": 1.0,
+        "symbol_mapping": {},
+        "close_on_opposite_signal": false
+    }
+}

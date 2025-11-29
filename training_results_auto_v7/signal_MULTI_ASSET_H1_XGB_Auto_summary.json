@@ -1,0 +1,20 @@
+{
+  "model_name": "signal_MULTI_ASSET_H1_XGB_Auto",
+  "training_date": "2025-04-21 21:50:02",
+  "cv_splits": 5,
+  "performance": {
+    "cv_roc_auc": 0.504279512988136,
+    "cv_f1": 0.0
+  },
+  "best_params": {
+    "learning_rate": 0.06054365855469246,
+    "min_child_weight": 8,
+    "max_depth": 3,
+    "gamma": 0.44447541666908114,
+    "subsample": 0.9162213204002109,
+    "colsample_bytree": 0.6061695553391381,
+    "alpha": 0.005337032762603957,
+    "lambda": 0.2327067708383781
+  },
+  "top_features": null
+}

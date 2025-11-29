@@ -1,0 +1,30 @@
+{
+  "top_features": [
+    "volatility_20d",
+    "macd_signal",
+    "volume_ma20",
+    "volume_change_1d",
+    "adx_14d",
+    "price_volume_corr_5d",
+    "cmf_20d",
+    "volume_change_5d",
+    "volume_ma5",
+    "volume_ma10",
+    "channel_pos_10d",
+    "volatility_10d",
+    "volatility_5d",
+    "returns_1d",
+    "obv"
+  ],
+  "selection_methods": [
+    "F-classification",
+    "Mutual Information",
+    "Random Forest Importance",
+    "RFE"
+  ],
+  "training_samples": 3331,
+  "total_features_evaluated": 43,
+  "creation_date": "2025-04-22 20:27:36",
+  "model_version": "1.0.0",
+  "python_version": "3.12"
+}

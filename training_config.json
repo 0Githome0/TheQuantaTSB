@@ -1,0 +1,38 @@
+{
+    "asset_files": {
+      "EURUSDm": "data/historical_data_EURUSD_H1.csv",
+      "XAUUSDm": "data/historical_data_XAUUSD_H1.csv",
+      "BTCUSDm": "data/historical_data_BTCUSD_H1.csv",
+      "GBPUSDm": "data/historical_data_GBPUSD_H1.csv",
+      "USDJPYm": "data/historical_data_USDJPY_H1.csv"
+    },
+    "output_model_base_name": "signal_MULTI_ASSET_H1_XGB_Auto",
+    "results_dir": "training_results_auto_v7",
+    "cv_splits": 5,
+    "optuna_trials": 150,
+    "optuna_timeout_seconds": null,
+    "target_method": "triple_barrier",
+    "triple_barrier_settings": {
+      "lookahead": 15,
+      "tp_mult": 1.8,
+      "sl_mult": 1.0,
+      "min_vol": 0.0005,
+      "cost_pips": 1.5
+    },
+    "simulation_v3_settings": {
+      "periods_ahead": 12,
+      "profit_factor": 1.8,
+      "sl_atr_factor": 1.6,
+      "cost_pips": 1.5,
+      "use_trailing_sl": true
+    },
+    "handle_imbalance": true,
+    "use_xgboost": true,
+    "early_stopping_optuna": 60,
+    "early_stopping_final": 40,
+    "use_rfecv": false,
+    "rfecv_step": 0.1,
+    "rfecv_min_features": 25,
+    "calibrate_probabilities": true,
+    "calibration_method": "isotonic"
+  }
