@@ -1,9 +1,11 @@
 import pandas as pd
 import logging
 import os
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from datetime import datetime, timedelta
-from ENTRY import AdvancedEntryStrategies, TimeFrames
-from Signal import SignalGenerator
+from src.core.entry import AdvancedEntryStrategies, TimeFrames
+from src.core.signal import SignalGenerator
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -52,7 +54,7 @@ def test_entry_strategies():
     
     # Try loading from config if it exists
     try:
-        entry_strategies = AdvancedEntryStrategies.from_config('entry_config.json')
+        entry_strategies = AdvancedEntryStrategies.from_config('config/entry_config.json')
         logger.info("Loaded entry strategies from config")
     except Exception as e:
         logger.warning(f"Could not load from config: {e}")

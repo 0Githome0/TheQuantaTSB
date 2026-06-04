@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from advanced_analysis import AdvancedAnalysis
+from src.core.advanced_analysis import AdvancedAnalysis
 
 # Configure basic logging
 logging.basicConfig(

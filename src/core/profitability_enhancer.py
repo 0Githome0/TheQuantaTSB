@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 
 # Import PerformanceTracker safely
 if TYPE_CHECKING:
-    from performance_tracker import PerformanceTracker
+    from src.core.performance_tracker import PerformanceTracker
 
 # Configure logging
 log = logging.getLogger('ProfitabilityEnhancer')

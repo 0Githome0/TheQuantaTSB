@@ -40,7 +40,7 @@ RESULTS_DIR = 'training_results_auto_v7'  # Default, will be overridden by confi
 # --- Signal Generator Import & Feature Lists ---
 try:
     print("Attempting to import SignalGenerator and TimeFrames from Signal...")
-    from Signal import SignalGenerator, TimeFrames
+    from src.core.signal import SignalGenerator, TimeFrames
     print("Import successful!")
     # --- Feature Lists V7 (يمكن تعديلها حسب الحاجة وتحليل الأهمية) ---
     BASE_ML_FEATURES = [
@@ -70,7 +70,7 @@ except ImportError: print("Error: Signal.py not found."); exit()
 except Exception as e: print(f"Error during initial setup: {e}"); exit()
 
 # --- Configuration Loading ---
-CONFIG_FILE = 'training_config.json'
+CONFIG_FILE = 'config/training_config.json'
 print(f"Attempting to load configuration from {CONFIG_FILE}...")
 try:
     with open(CONFIG_FILE, 'r') as f:

@@ -16,16 +16,21 @@ import warnings
 import os
 import json
 from typing import Dict, Optional, List, Any, Tuple
-from ENTRY import AdvancedEntryStrategies
+from src.core.entry import AdvancedEntryStrategies
 
 # Import your custom modules
 try:
-    from Signal import SignalGenerator, TimeFrames
-    from advanced_analysis import AdvancedAnalysis
+    from src.core.signal import SignalGenerator, TimeFrames
+    from src.core.advanced_analysis import AdvancedAnalysis
     # ---> ADDED IMPORTS <---
-    from performance_tracker import PerformanceTracker
-    from profitability_enhancer import ProfitabilityEnhancer
-    from execution_manager import ExecutionManager
+    from src.core.performance_tracker import PerformanceTracker
+    from src.core.profitability_enhancer import ProfitabilityEnhancer
+    from src.core.execution_manager import ExecutionManager
+    from src.gui.insider_ui import InsiderTradingFrame
+    from src.gui.settings_ui import SettingsDialog
+    from src.gui.backtester_ui import BacktesterFrame
+    from src.gui.strategy_ui import StrategyControlFrame
+    from src.core.strategy_manager import StrategyManager
     # ---> END ADDED IMPORTS <---
 except ImportError as e:
     # Updated error message to include new modules
@@ -39,17 +44,51 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 # --- Constants ---
-APP_NAME = "FXL V1 - Signal Bot"
-WINDOW_WIDTH = 1350 # Slightly wider
-WINDOW_HEIGHT = 820
-UPDATE_INTERVAL_MS = 250  # Slightly faster UI updates
-DASHBOARD_UPDATE_INTERVAL_MS = 5000 # How often to update Perf/Positions tabs (5 seconds)
-CONFIG_FILE = "config.json"
-LOG_FILE = 'logs/main_app.log' # Centralized log file definition
+APP_NAME = "TheQuanta"
+WINDOW_WIDTH = 1400
+WINDOW_HEIGHT = 850
+UPDATE_INTERVAL_MS = 250
+DASHBOARD_UPDATE_INTERVAL_MS = 500
+CONFIG_FILE = "config/config.json"
+LOG_FILE = 'logs/main_app.log'
+LOGO_PATH = "assets/logo.png"
 
-# --- UI Theme ---
+# --- Modern UI Theme Colors (Cyber/Teal Palette) ---
+# Background Colors
+BG_DARK = "#0b0e11"           # Main background (Deep Dark)
+BG_CARD = "#151a21"           # Card/panel background (Soft Dark)
+BG_SIDEBAR = "#0b0e11"        # Sidebar background
+BG_HOVER = "#1e2630"          # Hover state background
+
+# Border & Accent Colors
+BORDER_COLOR = "#232d3b"      # Subtle borders
+ACCENT_TEAL = "#00f2ea"       # Primary accent (Cyber Cyan)
+ACCENT_BLUE = "#3b82f6"       # Secondary accent (Bright Blue)
+
+# Status Colors
+SUCCESS_GREEN = "#10b981"     # Profit/success/BUY (Emerald)
+DANGER_RED = "#ef4444"        # Loss/error/SELL (Bright Red)
+WARNING_YELLOW = "#f59e0b"    # Warnings (Amber)
+
+# Text Colors
+TEXT_PRIMARY = "#ffffff"      # Main text (White)
+TEXT_SECONDARY = "#94a3b8"    # Muted text (Cool Gray)
+TEXT_MUTED = "#64748b"        # Very muted text
+
+# Fonts
+MAIN_FONT = ("Roboto Medium", 13)
+HEADER_FONT = ("Roboto Medium", 20)
+SUBHEADER_FONT = ("Roboto Medium", 16)
+BOLD_FONT = ("Roboto Bold", 13)
+MONO_FONT = ("Consolas", 12)
+
+# --- UI Theme Setup ---
 try:
     ctk.set_appearance_mode("Dark")
+    ctk.set_default_color_theme("dark-blue") # Switching to built-in dark-blue as base
+    ctk.set_widget_scaling(1.0)
+except Exception as e:
+    print(f"Warning: Could not set CustomTkinter theme: {e}")
     ctk.set_default_color_theme("blue")
 except Exception as e:
     print(f"Warning: Could not set CustomTkinter theme: {e}")
@@ -137,22 +176,38 @@ class DataManager:
                 return False
 
             logger.info(f"Attempting MT5 login for account {login} on server {server}...")
-            start_time = time.time()
-            authorized = mt5.login(login, password=password, server=server)
-            duration = time.time() - start_time
-            logger.debug(f"mt5.login() call took {duration:.2f}s")
+            
+            # Connection retry logic with exponential backoff
+            max_retries = 3
+            retry_delay = 2  # seconds
+            
+            for attempt in range(1, max_retries + 1):
+                start_time = time.time()
+                authorized = mt5.login(login, password=password, server=server)
+                duration = time.time() - start_time
+                logger.debug(f"mt5.login() attempt {attempt} took {duration:.2f}s")
 
-            if authorized:
-                acc_info = mt5.account_info()
-                currency = acc_info.currency if acc_info else "N/A"
-                logger.info(f"MT5 Login Successful! Account: {login}, Name: {acc_info.name if acc_info else 'N/A'}, Currency: {currency}")
-                self.is_initialized = True
-                return True
-            else:
-                logger.error(f"MT5 Login Failed for account {login} on {server}. Error code: {mt5.last_error()}")
-                mt5.shutdown() # Shutdown if login failed
-                self.is_initialized = False
-                return False
+                if authorized:
+                    acc_info = mt5.account_info()
+                    currency = acc_info.currency if acc_info else "N/A"
+                    logger.info(f"MT5 Login Successful! Account: {login}, Name: {acc_info.name if acc_info else 'N/A'}, Currency: {currency}")
+                    self.is_initialized = True
+                    return True
+                else:
+                    error = mt5.last_error()
+                    logger.warning(f"MT5 Login attempt {attempt}/{max_retries} failed. Error: {error}")
+                    
+                    if attempt < max_retries:
+                        logger.info(f"Retrying in {retry_delay} seconds...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                    else:
+                        logger.error(f"MT5 Login Failed after {max_retries} attempts for account {login} on {server}.")
+                        mt5.shutdown()
+                        self.is_initialized = False
+                        return False
+            
+            return False
 
     def disconnect_mt5(self):
         """Shuts down MetaTrader 5 connection if initialized."""
@@ -352,46 +407,25 @@ class TradingApp(ctk.CTk):
             return {}
 
     def _save_config(self):
-        """Saves current UI settings back to CONFIG_FILE."""
-        logger.debug("Updating configuration dictionary from UI elements...")
+        """Saves current configuration dictionary to CONFIG_FILE."""
         try:
-            # --- Get UI values ---
-            pairs_str = self.entry_pairs.get()
-            tfs_str = self.entry_timeframes.get()
-
-            # --- Update Trading Pairs ---
-            pairs_list = [p.strip().upper() for p in pairs_str.split(',') if p.strip()]
-            if not pairs_list: messagebox.showwarning("Config Warning", "Trading Pairs list is empty.")
-            self.config["trading_pairs"] = pairs_list
-
-            # --- Update Timeframes ---
-            tfs_list = [tf.strip().upper() for tf in tfs_str.split(',') if tf.strip()]
-            valid_tfs = [tf for tf in tfs_list if tf in TimeFrames.__members__]
-            invalid_tfs = [tf for tf in tfs_list if tf not in TimeFrames.__members__]
-            if invalid_tfs: messagebox.showwarning("Config Warning", f"Invalid timeframes ignored: {', '.join(invalid_tfs)}")
-            if not valid_tfs: messagebox.showwarning("Config Warning", "Timeframes list is empty or only contains invalid entries.")
-            self.config["timeframes"] = valid_tfs
-
-            # --- Update Bot Settings (Example - add UI elements for these if needed) ---
-            self.config.setdefault("bot_settings", {})
-            # self.config["bot_settings"]["loop_sleep_seconds"] = int(self.entry_loop_sleep.get())
-
-            # --- Update Execution Manager Settings (Example - add UI elements if needed) ---
-            self.config.setdefault("execution_manager", ExecutionManager.DEFAULT_CONFIG.copy())
-            # self.config["execution_manager"]["risk_per_trade_pct"] = float(self.entry_risk_pct.get())
-            # self.config["execution_manager"]["max_concurrent_trades"] = int(self.entry_max_concurrent.get())
-
+            # Note: self.config is updated by SettingsDialog before calling this.
+            
             # --- Save ---
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(self.config, f, indent=4)
             logger.info(f"Configuration successfully saved to {CONFIG_FILE}")
+            
+            # Update internal state if needed (e.g. valid TFs)
+            # This ensures app state is consistent with new config immediately
             self.status_bar.set_status("Configuration Saved.", duration=5000)
+            
+            # Refresh config display (if any other parts rely on it)
+            self._update_config_display()
 
-        except ValueError as ve:
-             logger.error(f"Configuration save error: Invalid value entered. {ve}")
-             messagebox.showerror("Config Error", f"Invalid value entered. Please check numeric fields.\n{ve}")
         except Exception as e:
             logger.exception(f"Error saving configuration to '{CONFIG_FILE}': {e}")
+            messagebox.showerror("Save Error", f"Failed to save settings: {e}")
             messagebox.showerror("Config Error", f"Could not save configuration to {CONFIG_FILE}:\n{e}")
 
     def _apply_log_level(self):
@@ -408,150 +442,652 @@ class TradingApp(ctk.CTk):
 
     def _update_config_display(self):
         """Populates UI input fields from the loaded config dictionary."""
-        logger.debug("Populating UI configuration fields...")
-        self.entry_pairs.delete(0, tk.END)
-        self.entry_pairs.insert(0, ",".join(self.config.get("trading_pairs", [])))
-        self.entry_timeframes.delete(0, tk.END)
-        self.entry_timeframes.insert(0, ",".join(self.config.get("timeframes", [])))
-        # Update other UI fields linked to config here...
+        # No-op: Config is now handled by SettingsDialog and not displayed on main UI
+        pass
+
+    def _create_stat_card(self, parent, title: str, value: str, value_color: str) -> ctk.CTkFrame:
+        """Creates a styled stat card with title and value. Returns frame containing value_label."""
+        card = ctk.CTkFrame(parent, fg_color=BG_CARD, corner_radius=16, border_width=1, border_color=BORDER_COLOR)
+        
+        # Title label
+        title_label = ctk.CTkLabel(
+            card,
+            text=title,
+            font=MAIN_FONT,
+            text_color=TEXT_SECONDARY
+        )
+        title_label.pack(anchor="w", padx=16, pady=(12, 4))
+        
+        # Value label (big number)
+        value_label = ctk.CTkLabel(
+            card,
+            text=value,
+            font=HEADER_FONT,
+            text_color=value_color
+        )
+        value_label.pack(anchor="w", padx=12, pady=(0, 10))
+        
+        # Store value_label reference on the card for later updates
+        card.value_label = value_label
+        card.title_label = title_label
+        
+        return card
+    
+    def _update_stat_card(self, card: ctk.CTkFrame, value: str, color: str = None):
+        """Updates the value displayed on a stat card."""
+        if hasattr(card, 'value_label'):
+            card.value_label.configure(text=value)
+            if color:
+                card.value_label.configure(text_color=color)
 
     def _create_widgets(self):
-        """Creates and arranges all UI elements."""
+        """Creates and arranges all UI elements with modern dark theme."""
+        # Configure main window with dark background
+        self.configure(fg_color=BG_DARK)
+        
         # Main layout
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        # Left Frame (Keep mostly as is)
-        self.left_frame = ctk.CTkFrame(self, width=280, corner_radius=0)
+        # ═══════════════════════════════════════════════════════════════════
+        # LEFT SIDEBAR - Modern Dark Theme
+        # ═══════════════════════════════════════════════════════════════════
+        self.left_frame = ctk.CTkFrame(self, width=280, corner_radius=0, fg_color=BG_SIDEBAR, border_width=0)
         self.left_frame.grid(row=0, column=0, rowspan=2, sticky="nsw")
         self.left_frame.grid_propagate(False)
-        self.left_frame.grid_rowconfigure(20, weight=1) # Push content up
+        self.left_frame.grid_columnconfigure(0, weight=1)
+        self.left_frame.grid_rowconfigure(20, weight=1)
 
         current_row = 0
-        # Title
-        self.label_title = ctk.CTkLabel(self.left_frame, text=APP_NAME, font=ctk.CTkFont(size=20, weight="bold"))
-        self.label_title.grid(row=current_row, column=0, columnspan=2, padx=20, pady=(20, 15), sticky="ew")
+        
+        # ─── Logo & App Name ───
+        logo_frame = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        logo_frame.grid(row=current_row, column=0, columnspan=2, padx=24, pady=(30, 8), sticky="ew")
+        
+        # Try to load logo image
+        try:
+            from PIL import Image
+            logo_img = Image.open(LOGO_PATH)
+            self.logo_image = ctk.CTkImage(light_image=logo_img, dark_image=logo_img, size=(42, 42))
+            logo_label = ctk.CTkLabel(logo_frame, image=self.logo_image, text="")
+            logo_label.pack(side="left", padx=(0, 12))
+        except Exception as e:
+            logger.warning(f"Could not load logo: {e}")
+        
+        self.label_title = ctk.CTkLabel(
+            logo_frame, 
+            text=APP_NAME, 
+            font=("Roboto Medium", 24),
+            text_color=ACCENT_TEAL
+        )
+        self.label_title.pack(side="left")
         current_row += 1
-        # Separator
-        ctk.CTkFrame(self.left_frame, height=2, fg_color="gray50").grid(row=current_row, column=0, columnspan=2, padx=20, pady=(0, 10), sticky="ew")
+        
+        # Subtitle
+        ctk.CTkLabel(
+            self.left_frame, 
+            text="AI Trading Assistant", 
+            font=MAIN_FONT,
+            text_color=TEXT_SECONDARY
+        ).grid(row=current_row, column=0, columnspan=2, padx=24, pady=(0, 20), sticky="w")
         current_row += 1
-        # MT5 Controls
-        ctk.CTkLabel(self.left_frame, text="MetaTrader 5", font=ctk.CTkFont(weight="bold")).grid(row=current_row, column=0, columnspan=2, padx=20, pady=(0, 5), sticky="w")
-        current_row += 1
-        self.mt5_status_label = ctk.CTkLabel(self.left_frame, text="Status: Unknown", text_color="gray")
-        self.mt5_status_label.grid(row=current_row, column=0, padx=(20, 5), pady=5, sticky="w")
-        self.connect_mt5_button = ctk.CTkButton(self.left_frame, text="Connect", width=90, command=self._connect_mt5)
-        self.connect_mt5_button.grid(row=current_row, column=1, padx=(5, 20), pady=5, sticky="e")
-        current_row += 1
-        # Bot Controls
-        ctk.CTkLabel(self.left_frame, text="Bot Control", font=ctk.CTkFont(weight="bold")).grid(row=current_row, column=0, columnspan=2, padx=20, pady=(15, 5), sticky="w")
-        current_row += 1
-        self.bot_status_label = ctk.CTkLabel(self.left_frame, text="Status: Stopped", text_color="gray")
-        self.bot_status_label.grid(row=current_row, column=0, padx=(20, 5), pady=10, sticky="w")
-        button_frame = ctk.CTkFrame(self.left_frame, fg_color="transparent")
-        button_frame.grid(row=current_row, column=1, padx=(5, 20), pady=10, sticky="e")
-        self.start_button = ctk.CTkButton(button_frame, text="Start", width=60, command=self.start_bot)
-        self.start_button.pack(side=tk.LEFT, padx=(0, 5))
-        self.stop_button = ctk.CTkButton(button_frame, text="Stop", width=60, command=self.stop_bot, state=tk.DISABLED)
-        self.stop_button.pack(side=tk.LEFT)
-        current_row += 1
-        # Configuration Section
-        ctk.CTkLabel(self.left_frame, text="Configuration", font=ctk.CTkFont(weight="bold")).grid(row=current_row, column=0, columnspan=2, padx=20, pady=(20, 5), sticky="w")
-        current_row += 1
-        ctk.CTkLabel(self.left_frame, text="Trading Pairs (comma-separated):").grid(row=current_row, column=0, columnspan=2, padx=20, pady=(5,0), sticky="w")
-        current_row += 1
-        self.entry_pairs = ctk.CTkEntry(self.left_frame, placeholder_text="e.g., EURUSD,XAUUSD")
-        self.entry_pairs.grid(row=current_row, column=0, columnspan=2, padx=20, pady=(0,5), sticky="ew")
-        current_row += 1
-        ctk.CTkLabel(self.left_frame, text="Timeframes (comma-separated):").grid(row=current_row, column=0, columnspan=2, padx=20, pady=(5,0), sticky="w")
-        current_row += 1
-        self.entry_timeframes = ctk.CTkEntry(self.left_frame, placeholder_text="e.g., H1,H4")
-        self.entry_timeframes.grid(row=current_row, column=0, columnspan=2, padx=20, pady=(0,10), sticky="ew")
-        current_row += 1
-        self.save_config_button = ctk.CTkButton(self.left_frame, text="Save Configuration", command=self._save_config)
-        self.save_config_button.grid(row=current_row, column=0, columnspan=2, padx=20, pady=10, sticky="ew")
-        current_row += 1
-        # Actions Section
-        ctk.CTkLabel(self.left_frame, text="Display Actions", font=ctk.CTkFont(weight="bold")).grid(row=current_row, column=0, columnspan=2, padx=20, pady=(20, 5), sticky="w")
-        current_row += 1
-        self.clear_signals_button = ctk.CTkButton(self.left_frame, text="Clear Signals Display", command=self._clear_signals_display)
-        self.clear_signals_button.grid(row=current_row, column=0, columnspan=2, padx=20, pady=5, sticky="ew")
-        current_row += 1
-        self.clear_logs_button = ctk.CTkButton(self.left_frame, text="Clear Logs Display", command=self._clear_logs_display)
-        self.clear_logs_button.grid(row=current_row, column=0, columnspan=2, padx=20, pady=5, sticky="ew")
+        
+        # Separator line (Subtle)
+        ctk.CTkFrame(self.left_frame, height=1, fg_color=BORDER_COLOR).grid(
+            row=current_row, column=0, columnspan=2, padx=20, pady=(0, 20), sticky="ew"
+        )
         current_row += 1
 
-        # ---> UPDATED RIGHT FRAME (Tabs) <---
-        self.tab_view = ctk.CTkTabview(self, corner_radius=8)
-        self.tab_view.grid(row=0, column=1, padx=(10, 20), pady=(20, 10), sticky="nsew")
+        # ─── MT5 Connection Section ───
+        mt5_section = ctk.CTkFrame(self.left_frame, fg_color=BG_CARD, corner_radius=12, border_width=1, border_color=BORDER_COLOR)
+        mt5_section.grid(row=current_row, column=0, columnspan=2, padx=16, pady=(0, 12), sticky="ew")
+        
+        ctk.CTkLabel(
+            mt5_section, 
+            text="⚡ MetaTrader 5", 
+            font=BOLD_FONT,
+            text_color=TEXT_PRIMARY
+        ).pack(anchor="w", padx=14, pady=(12, 6))
+        
+        mt5_inner = ctk.CTkFrame(mt5_section, fg_color="transparent")
+        mt5_inner.pack(fill="x", padx=14, pady=(0, 12))
+        
+        self.mt5_status_label = ctk.CTkLabel(
+            mt5_inner, 
+            text="● Disconnected", 
+            text_color=TEXT_SECONDARY,
+            font=MAIN_FONT
+        )
+        self.mt5_status_label.pack(side="left")
+        
+        self.connect_mt5_button = ctk.CTkButton(
+            mt5_inner, 
+            text="Connect", 
+            width=85, 
+            height=30,
+            corner_radius=8,
+            fg_color=ACCENT_TEAL,
+            hover_color="#00dbc4", # Slightly darker cyan
+            text_color=BG_DARK,
+            font=BOLD_FONT,
+            command=self._connect_mt5
+        )
+        self.connect_mt5_button.pack(side="right")
+        current_row += 1
 
-        self.tab_view.add("Signals")
-        self.tab_view.add("Open Positions") # New Tab
-        self.tab_view.add("Performance")   # New Tab
-        self.tab_view.add("Market Summary")
-        self.tab_view.add("Logs")
-        self.tab_view.set("Signals") # Default tab
+        # ─── Bot Control Section ───
+        bot_section = ctk.CTkFrame(self.left_frame, fg_color=BG_CARD, corner_radius=12, border_width=1, border_color=BORDER_COLOR)
+        bot_section.grid(row=current_row, column=0, columnspan=2, padx=16, pady=(0, 12), sticky="ew")
+        
+        ctk.CTkLabel(
+            bot_section, 
+            text="🤖 Bot Control", 
+            font=BOLD_FONT,
+            text_color=TEXT_PRIMARY
+        ).pack(anchor="w", padx=14, pady=(12, 6))
+        
+        bot_inner = ctk.CTkFrame(bot_section, fg_color="transparent")
+        bot_inner.pack(fill="x", padx=14, pady=(0, 12))
+        
+        self.bot_status_label = ctk.CTkLabel(
+            bot_inner, 
+            text="● Stopped", 
+            text_color=TEXT_SECONDARY,
+            font=MAIN_FONT
+        )
+        self.bot_status_label.pack(side="left")
+        
+        button_frame = ctk.CTkFrame(bot_inner, fg_color="transparent")
+        button_frame.pack(side="right")
+        
+        self.start_button = ctk.CTkButton(
+            button_frame, 
+            text="▶ Start", 
+            width=70, 
+            height=30,
+            corner_radius=8,
+            fg_color=SUCCESS_GREEN,
+            hover_color="#10b981", # Emerald
+            text_color="white",
+            font=BOLD_FONT,
+            command=self.start_bot
+        )
+        self.start_button.pack(side="left", padx=(0, 6))
+        
+        self.stop_button = ctk.CTkButton(
+            button_frame, 
+            text="■ Stop", 
+            width=70, 
+            height=30,
+            corner_radius=8,
+            fg_color=DANGER_RED,
+            hover_color="#ef4444", # Red
+            text_color="white",
+            font=BOLD_FONT,
+            command=self.stop_bot, 
+            state=tk.DISABLED
+        )
+        self.stop_button.pack(side="left")
+        current_row += 1
 
-        # Signals Tab (Keep as is)
-        self.signals_scroll_frame = ctk.CTkScrollableFrame(self.tab_view.tab("Signals"), label_text="Generated Signals")
+        # ─── Settings Button ───
+        settings_frame = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        settings_frame.grid(row=current_row, column=0, columnspan=2, padx=16, pady=20, sticky="ew")
+        
+        self.settings_btn = ctk.CTkButton(
+            settings_frame,
+            text="⚙️ Settings",
+            fg_color=BG_CARD,
+            hover_color=BG_HOVER,
+            width=200,
+            command=self.open_settings
+        )
+        self.settings_btn.pack()
+        
+        current_row += 1
+
+        # ─── Quick Actions Section ───
+        actions_section = ctk.CTkFrame(self.left_frame, fg_color=BG_CARD, corner_radius=12, border_width=1, border_color=BORDER_COLOR)
+        actions_section.grid(row=current_row, column=0, columnspan=2, padx=16, pady=(5, 12), sticky="ew")
+        
+        ctk.CTkLabel(
+            actions_section, 
+            text="🎯 Quick Actions", 
+            font=BOLD_FONT,
+            text_color=TEXT_PRIMARY
+        ).pack(anchor="w", padx=14, pady=(12, 8))
+        
+        self.clear_signals_button = ctk.CTkButton(
+            actions_section, 
+            text="🗑️ Clear Signals", 
+            height=32,
+            corner_radius=8,
+            fg_color=BG_HOVER,
+            hover_color=BORDER_COLOR,
+            border_width=1,
+            border_color=BORDER_COLOR,
+            text_color=TEXT_PRIMARY,
+            font=MAIN_FONT,
+            command=self._clear_signals_display
+        )
+        self.clear_signals_button.pack(fill="x", padx=14, pady=(0, 6))
+        
+        self.clear_logs_button = ctk.CTkButton(
+            actions_section, 
+            text="📋 Clear Logs", 
+            height=32,
+            corner_radius=8,
+            fg_color=BG_HOVER,
+            hover_color=BORDER_COLOR,
+            border_width=1,
+            border_color=BORDER_COLOR,
+            text_color=TEXT_PRIMARY,
+            font=MAIN_FONT,
+            command=self._clear_logs_display
+        )
+        self.clear_logs_button.pack(fill="x", padx=14, pady=(0, 12))
+        current_row += 1
+
+        # ─── RISK MANAGEMENT DASHBOARD ───
+        risk_section = ctk.CTkFrame(self.left_frame, fg_color=BG_CARD, corner_radius=12, border_width=1, border_color=BORDER_COLOR)
+        risk_section.grid(row=current_row, column=0, columnspan=2, padx=16, pady=(5, 12), sticky="ew")
+        
+        ctk.CTkLabel(
+            risk_section, 
+            text="🛡️ Risk Management", 
+            font=BOLD_FONT,
+            text_color=TEXT_PRIMARY
+        ).pack(anchor="w", padx=14, pady=(12, 8))
+        
+        # Daily P&L
+        pnl_row = ctk.CTkFrame(risk_section, fg_color="transparent")
+        pnl_row.pack(fill="x", padx=14, pady=2)
+        ctk.CTkLabel(pnl_row, text="Daily P&L:", font=MAIN_FONT, text_color=TEXT_SECONDARY).pack(side="left")
+        self.daily_pnl_label = ctk.CTkLabel(pnl_row, text="$0.00", font=BOLD_FONT, text_color=TEXT_PRIMARY)
+        self.daily_pnl_label.pack(side="right")
+        
+        # Open Positions
+        pos_row = ctk.CTkFrame(risk_section, fg_color="transparent")
+        pos_row.pack(fill="x", padx=14, pady=2)
+        ctk.CTkLabel(pos_row, text="Open Positions:", font=MAIN_FONT, text_color=TEXT_SECONDARY).pack(side="left")
+        self.open_positions_label = ctk.CTkLabel(pos_row, text="0", font=BOLD_FONT, text_color=TEXT_PRIMARY)
+        self.open_positions_label.pack(side="right")
+        
+        # Exposure / Risk
+        risk_row = ctk.CTkFrame(risk_section, fg_color="transparent")
+        risk_row.pack(fill="x", padx=14, pady=2)
+        ctk.CTkLabel(risk_row, text="Total Exposure:", font=MAIN_FONT, text_color=TEXT_SECONDARY).pack(side="left")
+        self.exposure_label = ctk.CTkLabel(risk_row, text="0.00 lots", font=BOLD_FONT, text_color=TEXT_PRIMARY)
+        self.exposure_label.pack(side="right")
+        
+        # Auto-Trade Status
+        auto_row = ctk.CTkFrame(risk_section, fg_color="transparent")
+        auto_row.pack(fill="x", padx=14, pady=2)
+        ctk.CTkLabel(auto_row, text="Auto-Trade:", font=MAIN_FONT, text_color=TEXT_SECONDARY).pack(side="left")
+        self.auto_trade_label = ctk.CTkLabel(auto_row, text="● OFF", font=BOLD_FONT, text_color=TEXT_SECONDARY)
+        self.auto_trade_label.pack(side="right")
+        
+        # Guardian Status
+        guardian_row = ctk.CTkFrame(risk_section, fg_color="transparent")
+        guardian_row.pack(fill="x", padx=14, pady=(2, 8))
+        ctk.CTkLabel(guardian_row, text="Guardian:", font=MAIN_FONT, text_color=TEXT_SECONDARY).pack(side="left")
+        self.guardian_label = ctk.CTkLabel(guardian_row, text="● INACTIVE", font=BOLD_FONT, text_color=TEXT_SECONDARY)
+        self.guardian_label.pack(side="right")
+        
+        # Emergency Button
+        self.emergency_close_btn = ctk.CTkButton(
+            risk_section, 
+            text="🚨 CLOSE ALL POSITIONS", 
+            height=32,
+            corner_radius=8,
+            fg_color=DANGER_RED,
+            hover_color="#dc2626",
+            text_color="white",
+            font=BOLD_FONT,
+            command=self._emergency_close_all
+        )
+        self.emergency_close_btn.pack(fill="x", padx=14, pady=(0, 12))
+        current_row += 1
+
+        # ═══════════════════════════════════════════════════════════════════
+        # RIGHT CONTENT AREA - Tabs with Modern Theme
+        # ═══════════════════════════════════════════════════════════════════
+        self.tab_view = ctk.CTkTabview(
+            self, 
+            corner_radius=10,
+            fg_color=BG_CARD,
+            segmented_button_fg_color=BG_DARK,
+            segmented_button_selected_color=ACCENT_TEAL,
+            segmented_button_selected_hover_color="#00b894",
+            segmented_button_unselected_color=BG_DARK,
+            segmented_button_unselected_hover_color=BG_HOVER,
+            text_color=TEXT_PRIMARY,
+            border_width=1,
+            border_color=BORDER_COLOR
+        )
+        self.tab_view.grid(row=0, column=1, padx=(10, 15), pady=(15, 10), sticky="nsew")
+
+        self.tab_view.add("📊 Signals")
+        self.tab_view.add("📈 Positions")
+        self.tab_view.add("🏆 Performance")
+        self.tab_view.add("🎯 Strategies")  # NEW: Strategy Control
+        self.tab_view.add("🌍 Market")
+        self.tab_view.add("👁️ Insider") # New Tab
+        self.tab_view.add("🧪 Backtest") # Backtester Hub
+        self.tab_view.add("📜 Logs")
+        self.tab_view.set("📊 Signals")
+
+
+        # ─── Signals Tab ───
+        self.signals_scroll_frame = ctk.CTkScrollableFrame(
+            self.tab_view.tab("📊 Signals"), 
+            label_text="Live Trading Signals",
+            label_fg_color=BG_CARD,
+            fg_color=BG_DARK,
+            corner_radius=8
+        )
         self.signals_scroll_frame.pack(expand=True, fill="both", padx=5, pady=5)
         self.signals_scroll_frame.grid_columnconfigure(0, weight=1)
-        self.signals_placeholder = ctk.CTkLabel(self.signals_scroll_frame, text="Waiting for signals...", text_color="gray60")
-        self.signals_placeholder.pack(pady=20)
+        self.signals_placeholder = ctk.CTkLabel(
+            self.signals_scroll_frame, 
+            text="⏳ Waiting for signals...", 
+            text_color=TEXT_SECONDARY,
+            font=ctk.CTkFont(size=13)
+        )
+        self.signals_placeholder.pack(pady=40)
 
-        # Open Positions Tab
-        self.positions_textbox = ctk.CTkTextbox(self.tab_view.tab("Open Positions"), wrap=tk.NONE, corner_radius=6, font=("Consolas", 10)) # Monospaced, no wrap
-        self.positions_textbox.pack(expand=True, fill="both", padx=5, pady=5)
-        self.positions_textbox.insert("1.0", "Fetching open positions...\n")
-        self.positions_textbox.configure(state=tk.DISABLED) # Read-only
+        # ─── Positions Tab - Visual Cards Layout ───
+        self.positions_frame = ctk.CTkScrollableFrame(
+            self.tab_view.tab("📈 Positions"),
+            fg_color=BG_DARK,
+            corner_radius=8
+        )
+        self.positions_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        # Header row for positions
+        self.positions_header = ctk.CTkFrame(self.positions_frame, fg_color=BG_CARD, corner_radius=8)
+        self.positions_header.pack(fill="x", padx=0, pady=(0, 10))
+        
+        ctk.CTkLabel(
+            self.positions_header,
+            text="📈 Open Positions",
+            font=ctk.CTkFont(size=16, weight="bold"),
+            text_color=TEXT_PRIMARY
+        ).pack(side="left", padx=12, pady=10)
+        
+        self.positions_count_label = ctk.CTkLabel(
+            self.positions_header,
+            text="0 positions",
+            font=ctk.CTkFont(size=12),
+            text_color=TEXT_SECONDARY
+        )
+        self.positions_count_label.pack(side="right", padx=12, pady=10)
+        
+        # Summary stats row
+        self.positions_stats_frame = ctk.CTkFrame(self.positions_frame, fg_color="transparent")
+        self.positions_stats_frame.pack(fill="x", padx=0, pady=(0, 10))
+        self.positions_stats_frame.grid_columnconfigure((0, 1, 2), weight=1)
+        
+        # Total P/L card
+        self.pos_total_pnl_card = self._create_stat_card(self.positions_stats_frame, "💰 Total P/L", "$0.00", TEXT_SECONDARY)
+        self.pos_total_pnl_card.grid(row=0, column=0, padx=(0, 5), pady=0, sticky="nsew")
+        
+        # Buy positions
+        self.pos_buy_card = self._create_stat_card(self.positions_stats_frame, "🟢 Long Positions", "0", SUCCESS_GREEN)
+        self.pos_buy_card.grid(row=0, column=1, padx=5, pady=0, sticky="nsew")
+        
+        # Sell positions
+        self.pos_sell_card = self._create_stat_card(self.positions_stats_frame, "🔴 Short Positions", "0", DANGER_RED)
+        self.pos_sell_card.grid(row=0, column=2, padx=(5, 0), pady=0, sticky="nsew")
+        
+        # Container for individual position cards
+        self.positions_list_frame = ctk.CTkFrame(self.positions_frame, fg_color="transparent")
+        self.positions_list_frame.pack(fill="both", expand=True, padx=0, pady=0)
+        
+        # Placeholder when no positions
+        self.positions_placeholder = ctk.CTkLabel(
+            self.positions_list_frame,
+            text="📭 No open positions",
+            font=ctk.CTkFont(size=14),
+            text_color=TEXT_SECONDARY
+        )
+        self.positions_placeholder.pack(pady=30)
 
-        # Performance Tab
-        self.performance_frame = ctk.CTkFrame(self.tab_view.tab("Performance"))
+        # ─── Performance Tab - Visual Cards Layout ───
+        self.performance_frame = ctk.CTkScrollableFrame(
+            self.tab_view.tab("🏆 Performance"),
+            fg_color=BG_DARK,
+            corner_radius=8
+        )
         self.performance_frame.pack(fill="both", expand=True, padx=5, pady=5)
         
-        # Add controls frame at the top of Performance tab
-        self.perf_controls_frame = ctk.CTkFrame(self.performance_frame)
-        self.perf_controls_frame.pack(fill="x", padx=5, pady=5)
+        # Top controls row
+        self.perf_controls_frame = ctk.CTkFrame(self.performance_frame, fg_color=BG_CARD, corner_radius=8)
+        self.perf_controls_frame.pack(fill="x", padx=0, pady=(0, 10))
         
-        # Add Import Historical Trades button to Performance tab
+        ctk.CTkLabel(
+            self.perf_controls_frame,
+            text="📊 Performance Dashboard",
+            font=ctk.CTkFont(size=16, weight="bold"),
+            text_color=TEXT_PRIMARY
+        ).pack(side="left", padx=12, pady=10)
+        
         self.import_history_button = ctk.CTkButton(
             self.perf_controls_frame,
-            text="📥 Import Historical Trades",
+            text="📥 Import",
             command=self._import_historical_trades,
-            fg_color="#2a52be",
-            hover_color="#1e3c8c",
-            width=200
+            fg_color=ACCENT_BLUE,
+            hover_color="#4c8ed9",
+            corner_radius=6,
+            height=28,
+            width=90
         )
-        self.import_history_button.pack(side="left", padx=5, pady=5)
+        self.import_history_button.pack(side="right", padx=5, pady=8)
         
-        # Add Export Trade History button to Performance tab
         self.export_history_button = ctk.CTkButton(
             self.perf_controls_frame,
-            text="📤 Export Trade History",
+            text="📤 Export",
             command=self._export_trade_history,
-            fg_color="#2a52be",
-            hover_color="#1e3c8c",
-            width=200
+            fg_color=BG_HOVER,
+            hover_color=BORDER_COLOR,
+            corner_radius=6,
+            height=28,
+            width=90
         )
-        self.export_history_button.pack(side="left", padx=5, pady=5)
+        self.export_history_button.pack(side="right", padx=5, pady=8)
         
-        # Create performance content frame below controls
-        self.perf_content_frame = ctk.CTkFrame(self.performance_frame)
-        self.perf_content_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        # === MT5 Account Stats Row ===
+        self.mt5_stats_frame = ctk.CTkFrame(self.performance_frame, fg_color="transparent")
+        self.mt5_stats_frame.pack(fill="x", padx=0, pady=(0, 10))
+        self.mt5_stats_frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
         
-        self.performance_textbox = ctk.CTkTextbox(self.perf_content_frame, wrap=tk.WORD, corner_radius=6, font=("Consolas", 11))
-        self.performance_textbox.pack(expand=True, fill="both", padx=5, pady=5)
-        self.performance_textbox.insert("1.0", "Fetching performance metrics...\n")
-        self.performance_textbox.configure(state=tk.DISABLED) # Read-only
+        # Balance Card
+        self.balance_card = self._create_stat_card(self.mt5_stats_frame, "💰 Balance", "$0.00", SUCCESS_GREEN)
+        self.balance_card.grid(row=0, column=0, padx=(0, 5), pady=0, sticky="nsew")
+        
+        # Equity Card
+        self.equity_card = self._create_stat_card(self.mt5_stats_frame, "💎 Equity", "$0.00", ACCENT_BLUE)
+        self.equity_card.grid(row=0, column=1, padx=5, pady=0, sticky="nsew")
+        
+        # Profit/Loss Card
+        self.pnl_card = self._create_stat_card(self.mt5_stats_frame, "📈 Today's P/L", "$0.00", TEXT_SECONDARY)
+        self.pnl_card.grid(row=0, column=2, padx=5, pady=0, sticky="nsew")
+        
+        # Win Rate Card
+        self.winrate_card = self._create_stat_card(self.mt5_stats_frame, "🎯 Win Rate", "0%", ACCENT_TEAL)
+        self.winrate_card.grid(row=0, column=3, padx=(5, 0), pady=0, sticky="nsew")
+        
+        # === Today's Trading Stats Row ===
+        self.today_stats_frame = ctk.CTkFrame(self.performance_frame, fg_color="transparent")
+        self.today_stats_frame.pack(fill="x", padx=0, pady=(0, 10))
+        self.today_stats_frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
+        
+        # Trades Today
+        self.trades_today_card = self._create_stat_card(self.today_stats_frame, "📊 Trades Today", "0", TEXT_PRIMARY)
+        self.trades_today_card.grid(row=0, column=0, padx=(0, 5), pady=0, sticky="nsew")
+        
+        # Wins
+        self.wins_card = self._create_stat_card(self.today_stats_frame, "✅ Wins", "0", SUCCESS_GREEN)
+        self.wins_card.grid(row=0, column=1, padx=5, pady=0, sticky="nsew")
+        
+        # Losses
+        self.losses_card = self._create_stat_card(self.today_stats_frame, "❌ Losses", "0", DANGER_RED)
+        self.losses_card.grid(row=0, column=2, padx=5, pady=0, sticky="nsew")
+        
+        # Expectancy
+        self.expectancy_card = self._create_stat_card(self.today_stats_frame, "💹 Expectancy", "$0.00", ACCENT_TEAL)
+        self.expectancy_card.grid(row=0, column=3, padx=(5, 0), pady=0, sticky="nsew")
+        
+        # === Bot Performance Section ===
+        bot_perf_header = ctk.CTkFrame(self.performance_frame, fg_color=BG_CARD, corner_radius=8)
+        bot_perf_header.pack(fill="x", padx=0, pady=(0, 10))
+        ctk.CTkLabel(
+            bot_perf_header,
+            text="🤖 Bot Tracked Performance",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color=TEXT_PRIMARY
+        ).pack(side="left", padx=12, pady=10)
+        
+        self.bot_stats_frame = ctk.CTkFrame(self.performance_frame, fg_color="transparent")
+        self.bot_stats_frame.pack(fill="x", padx=0, pady=(0, 10))
+        self.bot_stats_frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
+        
+        # Total Trades
+        self.total_trades_card = self._create_stat_card(self.bot_stats_frame, "📊 Total Trades", "0", TEXT_PRIMARY)
+        self.total_trades_card.grid(row=0, column=0, padx=(0, 5), pady=0, sticky="nsew")
+        
+        # Profit Factor
+        self.profit_factor_card = self._create_stat_card(self.bot_stats_frame, "📈 Profit Factor", "0.00", ACCENT_BLUE)
+        self.profit_factor_card.grid(row=0, column=1, padx=5, pady=0, sticky="nsew")
+        
+        # Total P/L
+        self.total_pnl_card = self._create_stat_card(self.bot_stats_frame, "💵 Total P/L", "$0.00", TEXT_SECONDARY)
+        self.total_pnl_card.grid(row=0, column=2, padx=5, pady=0, sticky="nsew")
+        
+        # Avg Win
+        self.avg_win_card = self._create_stat_card(self.bot_stats_frame, "📊 Avg Win", "$0.00", SUCCESS_GREEN)
+        self.avg_win_card.grid(row=0, column=3, padx=(5, 0), pady=0, sticky="nsew")
 
-        # Market Summary Tab (Keep as is)
-        self.summary_textbox = ctk.CTkTextbox(self.tab_view.tab("Market Summary"), wrap=tk.WORD, corner_radius=6, font=("Consolas", 11))
-        self.summary_textbox.pack(expand=True, fill="both", padx=5, pady=5)
-        self.summary_textbox.insert("1.0", "Market summary will update periodically while bot is running...\n")
-        self.summary_textbox.configure(state=tk.DISABLED)
+        # ─── Market Summary Tab - Visual Cards Layout ───
+        self.market_frame = ctk.CTkScrollableFrame(
+            self.tab_view.tab("🌍 Market"),
+            fg_color=BG_DARK,
+            corner_radius=8
+        )
+        self.market_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        # Header row
+        self.market_header = ctk.CTkFrame(self.market_frame, fg_color=BG_CARD, corner_radius=8)
+        self.market_header.pack(fill="x", padx=0, pady=(0, 10))
+        
+        ctk.CTkLabel(
+            self.market_header,
+            text="🌍 Market Overview",
+            font=ctk.CTkFont(size=16, weight="bold"),
+            text_color=TEXT_PRIMARY
+        ).pack(side="left", padx=12, pady=10)
+        
+        self.market_update_label = ctk.CTkLabel(
+            self.market_header,
+            text="Last update: —",
+            font=ctk.CTkFont(size=11),
+            text_color=TEXT_SECONDARY
+        )
+        self.market_update_label.pack(side="right", padx=12, pady=10)
+        
+        # Market Mood Stats Row
+        self.market_stats_frame = ctk.CTkFrame(self.market_frame, fg_color="transparent")
+        self.market_stats_frame.pack(fill="x", padx=0, pady=(0, 10))
+        self.market_stats_frame.grid_columnconfigure((0, 1, 2), weight=1)
+        
+        # Overall Mood Card
+        self.market_mood_card = self._create_stat_card(self.market_stats_frame, "📊 Market Mood", "—", TEXT_SECONDARY)
+        self.market_mood_card.grid(row=0, column=0, padx=(0, 5), pady=0, sticky="nsew")
+        
+        # Sentiment Score Card
+        self.sentiment_score_card = self._create_stat_card(self.market_stats_frame, "📈 Sentiment", "0.00", TEXT_SECONDARY)
+        self.sentiment_score_card.grid(row=0, column=1, padx=5, pady=0, sticky="nsew")
+        
+        # News Count Card
+        self.news_count_card = self._create_stat_card(self.market_stats_frame, "📰 News Items", "0", ACCENT_BLUE)
+        self.news_count_card.grid(row=0, column=2, padx=(5, 0), pady=0, sticky="nsew")
+        
+        # Section header for pairs
+        pairs_header = ctk.CTkFrame(self.market_frame, fg_color=BG_CARD, corner_radius=8)
+        pairs_header.pack(fill="x", padx=0, pady=(0, 10))
+        ctk.CTkLabel(
+            pairs_header,
+            text="💱 Currency Pairs Analysis",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color=TEXT_PRIMARY
+        ).pack(side="left", padx=12, pady=10)
+        
+        # Container for currency pair cards
+        self.market_pairs_frame = ctk.CTkFrame(self.market_frame, fg_color="transparent")
+        self.market_pairs_frame.pack(fill="both", expand=True, padx=0, pady=0)
+        
+        # Placeholder when no data
+        self.market_placeholder = ctk.CTkLabel(
+            self.market_pairs_frame,
+            text="⏳ Waiting for market data...\nStart the bot to generate market summary.",
+            font=ctk.CTkFont(size=13),
+            text_color=TEXT_SECONDARY
+        )
+        self.market_placeholder.pack(pady=30)
 
-        # Log Tab (Keep as is)
-        self.log_textbox = ctk.CTkTextbox(self.tab_view.tab("Logs"), wrap=tk.WORD, corner_radius=6, font=("Consolas", 10))
+        # ─── Strategies Tab ─── NEW
+        try:
+            self.strategy_manager = StrategyManager()
+            self.strategy_control_frame = StrategyControlFrame(
+                self.tab_view.tab("🎯 Strategies"),
+                strategy_manager=self.strategy_manager,
+                on_deploy_strategy=self._on_strategy_deployed
+            )
+            self.strategy_control_frame.pack(fill="both", expand=True)
+        except Exception as e:
+            # Fallback if StrategyControlFrame fails to load
+            self.strategy_manager = None
+            self.strategy_control_frame = None
+            ctk.CTkLabel(
+                self.tab_view.tab("🎯 Strategies"),
+                text=f"Strategy Manager not available: {e}",
+                text_color=TEXT_SECONDARY
+            ).pack(pady=50)
+
+        # ─── Insiders Tab ───
+        self.insider_frame = InsiderTradingFrame(
+            self.tab_view.tab("👁️ Insider"),
+            execute_callback=lambda pair, direction, volume, use_market_price: self._manual_execute_trade({
+                'pair': pair,
+                'direction': direction,
+                'volume': volume,
+                'entry_price': 0.0,
+                'stop_loss': 0.0,
+                'take_profit': 0.0,
+                'timeframe': "Insider"
+            })
+        )
+        self.insider_frame.pack(fill="both", expand=True)
+
+        # ─── Backtest Tab ───
+        self.backtester_frame = BacktesterFrame(
+            self.tab_view.tab("🧪 Backtest"),
+            data_manager=self.data_manager,
+            signal_generator=self.signal_generator
+        )
+        self.backtester_frame.pack(fill="both", expand=True)
+
+        # ─── Logs Tab ───
+        self.log_textbox = ctk.CTkTextbox(
+            self.tab_view.tab("📜 Logs"), 
+            wrap=tk.WORD, 
+            corner_radius=8, 
+            font=("Consolas", 10),
+            fg_color=BG_DARK,
+            text_color=TEXT_SECONDARY,
+            border_width=1,
+            border_color=BORDER_COLOR
+        )
         self.log_textbox.pack(expand=True, fill="both", padx=5, pady=5)
         self.log_textbox.configure(state=tk.DISABLED)
 
@@ -576,8 +1112,9 @@ class TradingApp(ctk.CTk):
     def _update_mt5_ui(self, connected: bool):
         """Updates UI elements and passes MT5 instance to components."""
         if connected:
-            self.mt5_status_label.configure(text="Status: Connected", text_color="lightgreen")
-            self.status_bar.set_status("MT5 Connected.", duration=10000, priority=False)
+            self.mt5_status_label.configure(text="● Connected", text_color=SUCCESS_GREEN)
+            self.connect_mt5_button.configure(text="Disconnect", fg_color=DANGER_RED, hover_color="#da3633")
+            self.status_bar.set_status("✅ MT5 Connected.", duration=10000, priority=False)
             self.connect_mt5_button.configure(text="Disconnect", command=self._disconnect_mt5)
             # ---> PASS MT5 INSTANCE & INITIALIZE LOCK <---
             if hasattr(self, 'advanced_analyzer'):
@@ -651,50 +1188,386 @@ class TradingApp(ctk.CTk):
 
     # ---> NEW DASHBOARD UPDATE FUNCTION <---
     def _update_dashboard_tabs(self):
-        """Periodically updates the Open Positions and Performance tabs."""
+        """Periodically updates the Open Positions and Performance tabs with visual cards."""
         logger.debug("Updating dashboard tabs (Positions, Performance)...")
         try:
             # Update Open Positions Tab
             self._update_positions_tab()
 
-            # Update Performance Tab
+            # Update Performance Cards with MT5 Account Data
+            if self.data_manager and self.data_manager.is_initialized:
+                try:
+                    acc_info = mt5.account_info()
+                    if acc_info:
+                        currency = acc_info.currency
+                        
+                        # Today's stats from MT5 deals
+                        today_stats = self._get_mt5_today_stats()
+
+                        # Update MT5 Account Cards
+                        self._update_stat_card(self.balance_card, f"${acc_info.balance:,.2f}", SUCCESS_GREEN)
+                        self._update_stat_card(self.equity_card, f"${acc_info.equity:,.2f}", ACCENT_BLUE)
+                        
+                        # P/L color based on positive/negative (Using Realized Day Profit)
+                        realized_day_pl = today_stats['profit']
+                        pnl_color = SUCCESS_GREEN if realized_day_pl >= 0 else DANGER_RED
+                        self._update_stat_card(self.pnl_card, f"${realized_day_pl:+,.2f}", pnl_color)
+                        
+                        # Win Rate
+                        if today_stats['trades_count'] > 0:
+                            today_wr = (today_stats['wins'] / today_stats['trades_count']) * 100
+                            wr_color = SUCCESS_GREEN if today_wr >= 50 else WARNING_YELLOW
+                            self._update_stat_card(self.winrate_card, f"{today_wr:.0f}%", wr_color)
+                        else:
+                            self._update_stat_card(self.winrate_card, "—", TEXT_SECONDARY)
+                        
+                        # Today Stats Cards
+                        self._update_stat_card(self.trades_today_card, str(today_stats['trades_count']), TEXT_PRIMARY)
+                        self._update_stat_card(self.wins_card, str(today_stats['wins']), SUCCESS_GREEN)
+                        self._update_stat_card(self.losses_card, str(today_stats['losses']), DANGER_RED)
+                        
+                        # Expectancy
+                        if today_stats['trades_count'] > 0:
+                            today_exp = today_stats['profit'] / today_stats['trades_count']
+                            exp_color = SUCCESS_GREEN if today_exp >= 0 else DANGER_RED
+                            self._update_stat_card(self.expectancy_card, f"${today_exp:+,.2f}", exp_color)
+                        else:
+                            self._update_stat_card(self.expectancy_card, "—", TEXT_SECONDARY)
+                            
+                except Exception as mt5_e:
+                    logger.warning(f"MT5 card update error: {mt5_e}")
+            else:
+                # MT5 not connected - show placeholder
+                self._update_stat_card(self.balance_card, "—", TEXT_SECONDARY)
+                self._update_stat_card(self.equity_card, "—", TEXT_SECONDARY)
+                self._update_stat_card(self.pnl_card, "—", TEXT_SECONDARY)
+                self._update_stat_card(self.winrate_card, "—", TEXT_SECONDARY)
+            
+            # Update Bot Tracker Cards
             if hasattr(self, 'tracker') and self.tracker:
-                metrics = self.tracker.get_performance_metrics() # Get overall metrics
-                perf_text = f"--- Performance Metrics ({datetime.now().strftime('%H:%M:%S')}) ---\n\n"
+                metrics = self.tracker.get_performance_metrics()
+                total_trades = metrics.get('total_trades', 0)
                 
-                # Update the performance textbox with metrics
-                if hasattr(self, 'performance_textbox'):
-                    # Format metrics for display
-                    perf_text += f"Total Trades: {metrics.get('total_trades', 0)}\n"
-                    perf_text += f"Win Rate: {metrics.get('win_rate', 0.0):.2f}%\n"
-                    perf_text += f"Profit Factor: {metrics.get('profit_factor', 0.0):.2f}\n"
-                    perf_text += f"Total Profit: {metrics.get('total_profit_currency', 0.0):.2f}\n"
-                    perf_text += f"Average Win: {metrics.get('average_win_currency', 0.0):.2f}\n"
-                    perf_text += f"Average Loss: {metrics.get('average_loss_currency', 0.0):.2f}\n"
-                    perf_text += f"Max Drawdown: {metrics.get('max_drawdown_currency', 0.0):.2f}\n"
+                if total_trades > 0:
+                    win_rate = metrics.get('win_rate', 0.0) * 100
+                    profit_factor = metrics.get('profit_factor') # Can be None (Inf)
+                    total_profit = metrics.get('total_profit_currency', 0.0)
+                    avg_win = metrics.get('average_win_currency', 0.0)
                     
-                    # Display trade breakdown by exit reason if available
-                    if 'exit_reason_breakdown' in metrics:
-                        perf_text += "\n--- Trade Breakdown by Exit Reason ---\n"
-                        for reason, stats in metrics.get('exit_reason_breakdown', {}).items():
-                            count = stats.get('count', 0)
-                            if count > 0:
-                                win_rate = stats.get('win_rate', 0.0)
-                                profit = stats.get('total_profit', 0.0)
-                                perf_text += f"{reason}: {count} trades, {win_rate:.2f}% win rate, {profit:.2f} profit\n"
+                    self._update_stat_card(self.total_trades_card, str(total_trades), TEXT_PRIMARY)
                     
-                    # Update the textbox
-                self.performance_textbox.configure(state=tk.NORMAL)
-                self.performance_textbox.delete("1.0", tk.END)
-                self.performance_textbox.insert("1.0", perf_text)
-                self.performance_textbox.configure(state=tk.DISABLED)
+                    if profit_factor is None:
+                         self._update_stat_card(self.profit_factor_card, "Inf", SUCCESS_GREEN)
+                    else:
+                         pf_color = SUCCESS_GREEN if profit_factor >= 1.0 else DANGER_RED
+                         self._update_stat_card(self.profit_factor_card, f"{profit_factor:.2f}", pf_color)
+                    
+                    pnl_color = SUCCESS_GREEN if total_profit >= 0 else DANGER_RED
+                    self._update_stat_card(self.total_pnl_card, f"${total_profit:+,.2f}", pnl_color)
+                    
+                    self._update_stat_card(self.avg_win_card, f"${avg_win:+,.2f}", SUCCESS_GREEN)
+                else:
+                    self._update_stat_card(self.total_trades_card, "0", TEXT_SECONDARY)
+                    self._update_stat_card(self.profit_factor_card, "—", TEXT_SECONDARY)
+                    self._update_stat_card(self.total_pnl_card, "$0.00", TEXT_SECONDARY)
+                    self._update_stat_card(self.avg_win_card, "$0.00", TEXT_SECONDARY)
 
         except Exception as e:
              logger.exception(f"Error updating dashboard tabs: {e}")
         
         # Reschedule the next dashboard update
         self.after(DASHBOARD_UPDATE_INTERVAL_MS, self._update_dashboard_tabs)
+    
+    def _on_strategy_deployed(self, strategy_name: str):
+        """Callback when a strategy is deployed for live trading."""
+        logger.info(f"🚀 Strategy deployed for live trading: {strategy_name}")
+        if hasattr(self, 'status_bar') and self.status_bar:
+            self.status_bar.set_status(f"✅ Strategy '{strategy_name}' deployed", duration=5000)
+    
+    def _get_mt5_today_stats(self) -> Dict:
+        """Gets today's trading statistics from MT5 deal history."""
+        stats = {'trades_count': 0, 'wins': 0, 'losses': 0, 'profit': 0.0}
+        try:
+            # Get today's date range
+            from datetime import timezone
+            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            tomorrow = today + timedelta(days=1)
+            
+            # Get today's deals
+            deals = mt5.history_deals_get(today, tomorrow)
+            if deals is None or len(deals) == 0:
+                return stats
+            
+            # Track positions we've seen
+            positions_profit = {}
+            
+            for deal in deals:
+                # Skip deposits/withdrawals (position_id == 0)
+                if deal.position_id == 0:
+                    continue
+                    
+                # Only count closing deals
+                if deal.entry in [mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT]:
+                    pos_id = deal.position_id
+                    if pos_id not in positions_profit:
+                        positions_profit[pos_id] = 0.0
+                    positions_profit[pos_id] += deal.profit + deal.commission + deal.swap
+            
+            # Count wins/losses
+            for pos_id, profit in positions_profit.items():
+                stats['trades_count'] += 1
+                stats['profit'] += profit
+                if profit >= 0:
+                    stats['wins'] += 1
+                else:
+                    stats['losses'] += 1
+                    
+        except Exception as e:
+            logger.warning(f"Error fetching today's MT5 stats: {e}")
+        
+        return stats
     # ---> END NEW DASHBOARD UPDATE FUNCTION <---
+    
+    def _update_positions_tab(self):
+        """Updates the positions tab with visual cards - updates in-place to prevent flickering."""
+        try:
+            # Initialize position cards dict if not exists
+            if not hasattr(self, '_position_cards'):
+                self._position_cards = {}  # ticket -> (card_frame, pnl_label, details_label, current_price_label)
+            
+            # Check MT5 connection
+            if not self.data_manager or not self.data_manager.is_initialized:
+                self._update_stat_card(self.pos_total_pnl_card, "—", TEXT_SECONDARY)
+                self._update_stat_card(self.pos_buy_card, "—", TEXT_SECONDARY)
+                self._update_stat_card(self.pos_sell_card, "—", TEXT_SECONDARY)
+                return
+            
+            if not mt5.terminal_info():
+                return
+            
+            # Get open positions from MT5
+            positions = mt5.positions_get()
+            
+            if positions is None or len(positions) == 0:
+                # No positions - clear all cards
+                for ticket, card_data in list(self._position_cards.items()):
+                    if card_data[0].winfo_exists():
+                        card_data[0].destroy()
+                self._position_cards.clear()
+                
+                self.positions_count_label.configure(text="0 positions")
+                self._update_stat_card(self.pos_total_pnl_card, "$0.00", TEXT_SECONDARY)
+                self._update_stat_card(self.pos_buy_card, "0", TEXT_SECONDARY)
+                self._update_stat_card(self.pos_sell_card, "0", TEXT_SECONDARY)
+                
+                if hasattr(self, 'positions_placeholder') and self.positions_placeholder.winfo_exists():
+                    if not self.positions_placeholder.winfo_ismapped():
+                        self.positions_placeholder.pack(pady=30)
+                return
+            
+            # Hide placeholder if we have positions
+            if hasattr(self, 'positions_placeholder') and self.positions_placeholder.winfo_exists():
+                if self.positions_placeholder.winfo_ismapped():
+                    self.positions_placeholder.pack_forget()
+            
+            # Track current position tickets
+            current_tickets = {pos.ticket for pos in positions}
+            
+            # Remove cards for closed positions
+            for ticket in list(self._position_cards.keys()):
+                if ticket not in current_tickets:
+                    card_data = self._position_cards.pop(ticket)
+                    if card_data[0].winfo_exists():
+                        card_data[0].destroy()
+            
+            # Calculate stats and update/create cards
+            total_pnl = 0.0
+            buy_count = 0
+            sell_count = 0
+            
+            for pos in positions:
+                total_pnl += pos.profit
+                if pos.type == 0:
+                    buy_count += 1
+                else:
+                    sell_count += 1
+                
+                if pos.ticket in self._position_cards:
+                    # Update existing card
+                    self._update_position_card_values(pos)
+                else:
+                    # Create new card
+                    self._create_position_card(pos)
+            
+            # Update summary cards
+            self.positions_count_label.configure(text=f"{len(positions)} position{'s' if len(positions) != 1 else ''}")
+            pnl_color = SUCCESS_GREEN if total_pnl >= 0 else DANGER_RED
+            self._update_stat_card(self.pos_total_pnl_card, f"${total_pnl:+,.2f}", pnl_color)
+            self._update_stat_card(self.pos_buy_card, str(buy_count), SUCCESS_GREEN if buy_count > 0 else TEXT_SECONDARY)
+            self._update_stat_card(self.pos_sell_card, str(sell_count), DANGER_RED if sell_count > 0 else TEXT_SECONDARY)
+            
+        except Exception as e:
+            logger.exception(f"Error updating positions tab: {e}")
+    
+    def _update_position_card_values(self, position):
+        """Updates only the changing values (P/L, current price) of an existing position card."""
+        if position.ticket not in self._position_cards:
+            return
+        
+        card_data = self._position_cards[position.ticket]
+        pnl_label = card_data[1]
+        details_label = card_data[2]
+        
+        # Update P/L
+        pnl_color = SUCCESS_GREEN if position.profit >= 0 else DANGER_RED
+        pnl_label.configure(text=f"${position.profit:+,.2f}", text_color=pnl_color)
+        
+        # Update details with current price
+        details_text = f"#{position.ticket} | Vol: {position.volume} | Open: {position.price_open:.5f} | Current: {position.price_current:.5f}"
+        if position.sl > 0:
+            details_text += f" | SL: {position.sl:.5f}"
+        if position.tp > 0:
+            details_text += f" | TP: {position.tp:.5f}"
+        details_label.configure(text=details_text)
+    
+    def _create_position_card(self, position):
+        """Creates a visual card for a single position with close button."""
+        is_buy = position.type == 0
+        direction = "BUY" if is_buy else "SELL"
+        border_color = SUCCESS_GREEN if is_buy else DANGER_RED
+        pnl_color = SUCCESS_GREEN if position.profit >= 0 else DANGER_RED
+        ticket = position.ticket
+        
+        # Main card frame
+        card = ctk.CTkFrame(self.positions_list_frame, fg_color=BG_CARD, corner_radius=16, border_width=1, border_color=BORDER_COLOR)
+        card.pack(fill="x", padx=0, pady=(0, 10))
+        
+        # Left border indicator (Thicker and rounded)
+        indicator = ctk.CTkFrame(card, width=5, fg_color=border_color, corner_radius=4)
+        indicator.grid(row=0, column=0, rowspan=2, sticky="ns", padx=(0, 0), pady=10)
+        
+        # Content frame
+        content = ctk.CTkFrame(card, fg_color="transparent")
+        content.grid(row=0, column=1, sticky="nsew", padx=12, pady=10)
+        content.grid_columnconfigure(0, weight=1)
+        card.grid_columnconfigure(1, weight=1)
+        
+        # Top row: Symbol, Direction, P/L, Close button
+        top_row = ctk.CTkFrame(content, fg_color="transparent")
+        top_row.pack(fill="x")
+        top_row.grid_columnconfigure(0, weight=1)
+        
+        symbol_label = ctk.CTkLabel(
+            top_row,
+            text=f"{position.symbol}",
+            font=SUBHEADER_FONT,
+            text_color=TEXT_PRIMARY
+        )
+        symbol_label.grid(row=0, column=0, sticky="w")
+        
+        direction_badge = ctk.CTkLabel(
+            top_row,
+            text=f"{'🟢' if is_buy else '🔴'} {direction}",
+            font=BOLD_FONT,
+            text_color=border_color
+        )
+        direction_badge.grid(row=0, column=1, sticky="e", padx=(12, 0))
+        
+        # Profit/Loss display
+        pnl_label = ctk.CTkLabel(
+            top_row,
+            text=f"${position.profit:+,.2f}",
+            font=HEADER_FONT,
+            text_color=pnl_color
+        )
+        pnl_label.grid(row=0, column=2, sticky="e", padx=(16, 12))
+        
+        # Close button
+        close_btn = ctk.CTkButton(
+            top_row,
+            text="✕ Close",
+            width=80,
+            height=28,
+            corner_radius=8,
+            fg_color=DANGER_RED,
+            hover_color="#ef4444",
+            text_color="white",
+            font=BOLD_FONT,
+            command=lambda t=ticket, s=position.symbol, v=position.volume, d=direction: self._close_position(t, s, v, d)
+        )
+        close_btn.grid(row=0, column=3, sticky="e", padx=(0, 0))
+        
+        # Bottom row: Details with ticket
+        details_text = f"#{ticket} | Vol: {position.volume} | Open: {position.price_open:.5f} | Current: {position.price_current:.5f}"
+        if position.sl > 0:
+            details_text += f" | SL: {position.sl:.5f}"
+        if position.tp > 0:
+            details_text += f" | TP: {position.tp:.5f}"
+        
+        details_label = ctk.CTkLabel(
+            content,
+            text=details_text,
+            font=ctk.CTkFont(size=10),
+            text_color=TEXT_SECONDARY
+        )
+        details_label.pack(fill="x", anchor="w", pady=(4, 0))
+        
+        # Store references for in-place updates
+        self._position_cards[ticket] = (card, pnl_label, details_label)
+    
+    def _close_position(self, ticket: int, symbol: str, volume: float, direction: str):
+        """Closes an open position by ticket."""
+        if not messagebox.askyesno("Confirm Close", 
+            f"Close {direction} position for {symbol}?\n\nTicket: {ticket}\nVolume: {volume}"):
+            return
+        
+        try:
+            # Determine order type (opposite of position)
+            order_type = mt5.ORDER_TYPE_SELL if direction == "BUY" else mt5.ORDER_TYPE_BUY
+            
+            # Get current price
+            tick = mt5.symbol_info_tick(symbol)
+            if not tick:
+                messagebox.showerror("Error", f"Could not get price for {symbol}")
+                return
+            
+            price = tick.bid if direction == "BUY" else tick.ask
+            
+            # Create close request
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": symbol,
+                "volume": volume,
+                "type": order_type,
+                "position": ticket,
+                "price": price,
+                "deviation": 20,
+                "magic": 123456,
+                "comment": "TheQuanta close",
+                "type_time": mt5.ORDER_TIME_GTC,
+            }
+            
+            logger.info(f"Closing position {ticket}: {request}")
+            result = mt5.order_send(request)
+            
+            if result is None:
+                messagebox.showerror("Error", f"Failed to close position.\nError: {mt5.last_error()}")
+                return
+            
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                logger.info(f"Position {ticket} closed successfully")
+                self.status_bar.set_status(f"Position {ticket} closed", duration=3000)
+                # Force immediate update
+                self._update_positions_tab()
+            else:
+                messagebox.showerror("Close Failed", 
+                    f"Failed to close position.\n\nError: {result.retcode}\n{result.comment}")
+                logger.error(f"Close position failed: {result.retcode} - {result.comment}")
+                
+        except Exception as e:
+            logger.exception(f"Error closing position: {e}")
+            messagebox.showerror("Error", f"Error closing position:\n{e}")
+
 
 
     # --- Signal Display Handling (Keep mostly as is) ---
@@ -709,219 +1582,306 @@ class TradingApp(ctk.CTk):
         
         # Update the display if the signal is still in the last_signals dictionary
         if signal_key in self.last_signals:
-            if len(self.last_signals[signal_key]) >= 6:  # Make sure we have enough elements
-                frame, label_pair_tf, label_line1, label_line2, label_line3, label_line4, *rest = self.last_signals[signal_key]
-                
-                # Update line3 with new entry time
-                entry = f"{signal_data.get('entry_price', 0.0):.5f}"
-                sl = f"{signal_data.get('stop_loss', 0.0):.5f}"
-                tp = f"{signal_data.get('take_profit', 0.0):.5f}"
-                line3_text = f"Entry: {entry} | Entry Time: {current_time} | SL: {sl} | TP: {tp}"
-                label_line3.configure(text=line3_text)
+            widgets = self.last_signals[signal_key]
+            
+            # Check if this is the new dict format
+            if isinstance(widgets, dict) and 'entry_time_label' in widgets:
+                widgets['entry_time_label'].configure(text=current_time)
+            
+            # Legacy tuple check (fallback/temp)
+            elif isinstance(widgets, tuple) and len(widgets) >= 5:
+                 pass # Legacy update logic removed to force new format
         
         # Schedule the next update in 0.1 seconds if still active
         if signal_data.get('entry_time_thread_active', False):
             self.after(100, lambda: self._update_entry_time(signal_key, signal_data))
 
     def _update_signals_display(self, signal_key: str, signal_data: Dict):
-        """Adds or updates a signal frame in the Signals scrollable frame."""
+        """Adds or updates a signal frame with a modern Cyber/Teal card design."""
         if hasattr(self, 'signals_placeholder') and self.signals_placeholder.winfo_exists():
             self.signals_placeholder.pack_forget()
             del self.signals_placeholder
-        details = signal_data.get('details', {})
-        # Example formatting for line 5:
-        details_str = f"RSI:{details.get('rsi','?')} | MACD_H:{details.get('macd_h','?')} | ADX:{details.get('adx','?')} | ATR%:{details.get('atr%','?')}"
+            
+        # Clean up old signal if it exists
+        if signal_key in self.last_signals:
+            widgets = self.last_signals[signal_key]
+            if isinstance(widgets, tuple): widgets[0].destroy()
+            elif isinstance(widgets, dict): widgets['frame'].destroy()
+            del self.last_signals[signal_key]
+
+        # Extract data
+        pair = signal_data.get('pair', '?')
+        timeframe = signal_data.get('timeframe', '?')
         direction = signal_data.get('direction', 'HOLD')
         recommendation = signal_data.get('advanced_analysis', {}).get('recommendation', direction)
-        if "STRONG_BUY" in recommendation: bg_color = "#006400"
-        elif "BUY" in recommendation: bg_color = "#008000"
-        elif "WEAK_BUY" in recommendation: bg_color = "#558B2F"
-        elif "STRONG_SELL" in recommendation: bg_color = "#8B0000"
-        elif "SELL" in recommendation: bg_color = "#B22222"
-        elif "WEAK_SELL" in recommendation: bg_color = "#CD5C5C"
-        elif "AVOID" in recommendation or "REVERSE" in recommendation: bg_color = "#FFA500"
-        else: bg_color = "gray25"
+        
+        # Colors & Visuals
+        if "BUY" in recommendation:
+            accent_color = SUCCESS_GREEN
+            badge_text = "BUY"
+            if "STRONG" in recommendation: badge_text = "STRONG BUY"
+            elif "WEAK" in recommendation: badge_text = "WEAK BUY"
+        elif "SELL" in recommendation:
+            accent_color = DANGER_RED
+            badge_text = "SELL"
+            if "STRONG" in recommendation: badge_text = "STRONG SELL"
+            elif "WEAK" in recommendation: badge_text = "WEAK SELL"
+        else:
+            accent_color = WARNING_YELLOW
+            badge_text = "WAIT"
 
-        pair_tf_text = f"{signal_data.get('pair', '?')} ({signal_data.get('timeframe', '?')}m)"
-        timestamp = signal_data.get('timestamp', datetime.now(pytz.utc).isoformat())
-        try:
-            ts_dt = datetime.fromisoformat(timestamp).astimezone(self.signal_generator.timezone)
-            ts_str = ts_dt.strftime('%H:%M:%S')
-        except: ts_str = timestamp.split('T')[-1].split('.')[0]
+        # --- CARD CONTAINER ---
+        card = ctk.CTkFrame(self.signals_scroll_frame, fg_color=BG_CARD, corner_radius=16, border_width=1, border_color=BORDER_COLOR)
+        card.pack(fill="x", padx=10, pady=(0, 15))
+        
+        # --- HEADER ROW (Pair + Badge) ---
+        header_frame = ctk.CTkFrame(card, fg_color="transparent")
+        header_frame.pack(fill="x", padx=16, pady=(16, 12))
+        
+        # Left: Pair & Timeframe
+        pair_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
+        pair_frame.pack(side="left")
+        
+        ctk.CTkLabel(pair_frame, text=pair, font=("Roboto Medium", 18), text_color=TEXT_PRIMARY).pack(anchor="w")
+        ctk.CTkLabel(pair_frame, text=f"{timeframe}m Timeframe", font=ctk.CTkFont(size=12), text_color=TEXT_SECONDARY).pack(anchor="w")
 
-        # Add entry time tracking (initialize with empty value)
-        if 'entry_time' not in signal_data:
-            signal_data['entry_time'] = ""
-            signal_data['entry_time_thread_active'] = False
+        # Right: Signal Badge
+        badge = ctk.CTkFrame(header_frame, fg_color="transparent", border_width=1, border_color=accent_color, corner_radius=20)
+        badge.pack(side="right")
+        
+        ctk.CTkLabel(badge, text=f"  {badge_text}  ", font=BOLD_FONT, text_color=accent_color).pack(padx=8, pady=4)
 
-        entry = f"{signal_data.get('entry_price', 0.0):.5f}"
-        sl = f"{signal_data.get('stop_loss', 0.0):.5f}"
-        tp = f"{signal_data.get('take_profit', 0.0):.5f}"
-        conf = signal_data.get('confidence', 0.0)
+        # --- GRID STATS ROW ---
+        grid = ctk.CTkFrame(card, fg_color=BG_DARK, corner_radius=10) # Inner darker container
+        grid.pack(fill="x", padx=16, pady=(0, 12))
+        grid.grid_columnconfigure((0,1,2,3), weight=1)
+        
+        # Helper to create stat box
+        def create_grid_item(col, label, value, color=TEXT_PRIMARY):
+            f = ctk.CTkFrame(grid, fg_color="transparent")
+            f.grid(row=0, column=col, pady=10, sticky="ew")
+            ctk.CTkLabel(f, text=label, font=ctk.CTkFont(size=10), text_color=TEXT_SECONDARY).pack()
+            l = ctk.CTkLabel(f, text=str(value), font=BOLD_FONT, text_color=color)
+            l.pack()
+            return l
+
+        entry_val = f"{signal_data.get('entry_price', 0.0):.5f}"
+        sl_val = f"{signal_data.get('stop_loss', 0.0):.5f}"
+        tp_val = f"{signal_data.get('take_profit', 0.0):.5f}"
+        conf_val = f"{signal_data.get('confidence', 0.0):.0%}"
+        
+        create_grid_item(0, "ENTRY", entry_val, TEXT_PRIMARY)
+        create_grid_item(1, "STOP LOSS", sl_val, DANGER_RED)
+        create_grid_item(2, "TAKE PROFIT", tp_val, SUCCESS_GREEN)
+        create_grid_item(3, "CONFIDENCE", conf_val, ACCENT_BLUE)
+        
+        # --- DETAILS ROW ---
+        details_frame = ctk.CTkFrame(card, fg_color="transparent")
+        details_frame.pack(fill="x", padx=16, pady=(0, 12))
+        
+        # Entry Time (from Order Flow or --:--:--)
+        time_row = ctk.CTkFrame(details_frame, fg_color="transparent")
+        time_row.pack(fill="x", pady=(0, 4))
+        ctk.CTkLabel(time_row, text="🕒 Entry Time: ", font=ctk.CTkFont(size=11), text_color=TEXT_SECONDARY).pack(side="left")
+        
+        # Get entry time from signal data
+        entry_time_val = signal_data.get('entry_time')
+        if entry_time_val:
+            try:
+                from datetime import datetime
+                if hasattr(entry_time_val, 'strftime'):
+                    entry_time_str = entry_time_val.strftime('%H:%M:%S')
+                else:
+                    entry_time_str = str(entry_time_val)[:8]
+            except:
+                entry_time_str = "--:--:--"
+        else:
+            entry_time_str = "--:--:--"
+        
+        entry_time_label = ctk.CTkLabel(time_row, text=entry_time_str, font=ctk.CTkFont(size=11, family="Consolas"), text_color=TEXT_PRIMARY)
+        entry_time_label.pack(side="left")
+
+        # --- ORDER FLOW STATUS ---
+        orderflow_data = signal_data.get('orderflow', {})
+        of_status = orderflow_data.get('status', 'NEUTRAL')
+        
+        of_row = ctk.CTkFrame(details_frame, fg_color="transparent")
+        of_row.pack(fill="x", pady=(0, 4))
+        
+        # Determine emoji and color
+        if of_status == "CONFIRM":
+            of_emoji = "🟢"
+            of_color = SUCCESS_GREEN
+            of_text = "Order Flow: CONFIRMS"
+        elif of_status == "OPPOSE":
+            of_emoji = "🔴"
+            of_color = DANGER_RED
+            of_text = "Order Flow: OPPOSES"
+        else:
+            of_emoji = "🟡"
+            of_color = WARNING_YELLOW
+            of_text = "Order Flow: NEUTRAL"
+        
+        ctk.CTkLabel(of_row, text=f"{of_emoji} {of_text}", font=ctk.CTkFont(size=11), text_color=of_color).pack(side="left")
+        
+        # Show reason if available
+        of_reasons = orderflow_data.get('reasons', [])
+        if of_reasons and len(of_reasons) > 0:
+            reason_text = of_reasons[0][:40] + "..." if len(of_reasons[0]) > 40 else of_reasons[0]
+            ctk.CTkLabel(of_row, text=f"  ({reason_text})", font=ctk.CTkFont(size=10), text_color=TEXT_MUTED).pack(side="left")
+
+        # News/Sentiment
+        adv = signal_data.get('advanced_analysis', {})
+        sent_score = adv.get('sentiment', {}).get('sentiment_score', 0)
+        sent_emoji = "📈" if sent_score > 0.1 else "📉" if sent_score < -0.1 else "➡️"
+        news_text = f"{sent_emoji} News Sentiment: {adv.get('sentiment', {}).get('sentiment', 'neutral').upper()} ({sent_score:+.2f})"
+        
+        ctk.CTkLabel(details_frame, text=news_text, font=ctk.CTkFont(size=11), text_color=TEXT_SECONDARY).pack(anchor="w")
+        
+        # Strategy
+        strategy = signal_data.get('entry_recommendation', {}).get('best_strategy', 'Standard')
+        ctk.CTkLabel(details_frame, text=f"⚙️ Strategy: {strategy}", font=ctk.CTkFont(size=11), text_color=TEXT_MUTED).pack(anchor="w", pady=(2, 6))
+
+        # --- SIGNAL GRADE & ENHANCED INFO ---
+        grade = signal_data.get('grade', 'C')
+        grade_score = signal_data.get('grade_score', 0)
+        grade_action = signal_data.get('grade_action', 'WAIT')
+        
+        grade_colors = {'A+': SUCCESS_GREEN, 'A': SUCCESS_GREEN, 'B': WARNING_YELLOW, 'C': DANGER_RED}
+        grade_color = grade_colors.get(grade, TEXT_MUTED)
+        
+        grade_row = ctk.CTkFrame(details_frame, fg_color="transparent")
+        grade_row.pack(fill="x", pady=(0, 4))
+        
+        ctk.CTkLabel(grade_row, text=f"📊 Signal Grade: ", font=ctk.CTkFont(size=11), text_color=TEXT_SECONDARY).pack(side="left")
+        ctk.CTkLabel(grade_row, text=f"{grade}", font=ctk.CTkFont(size=13, weight="bold"), text_color=grade_color).pack(side="left")
+        ctk.CTkLabel(grade_row, text=f" ({grade_score:.0%}) → {grade_action}", font=ctk.CTkFont(size=10), text_color=TEXT_MUTED).pack(side="left")
+        
+        # Session & MTF Confluence
+        session_info = signal_data.get('session', {})
+        mtf_info = signal_data.get('mtf_confluence', {})
+        
+        session_row = ctk.CTkFrame(details_frame, fg_color="transparent")
+        session_row.pack(fill="x", pady=(0, 4))
+        
+        active_sessions = session_info.get('active', [])
+        session_text = ', '.join(active_sessions[:2]) if active_sessions else 'None'
+        session_quality = session_info.get('quality', 0.5)
+        session_emoji = "🌟" if session_quality >= 0.8 else ("✨" if session_quality >= 0.6 else "⭐")
+        
+        ctk.CTkLabel(session_row, text=f"{session_emoji} Session: {session_text}", font=ctk.CTkFont(size=10), text_color=TEXT_SECONDARY).pack(side="left")
+        
+        mtf_align = mtf_info.get('alignment', 'UNKNOWN')
+        mtf_emoji = "✅" if 'ALIGNED' in mtf_align else ("⚠️" if 'PARTIAL' in mtf_align else "❌")
+        ctk.CTkLabel(session_row, text=f"  |  {mtf_emoji} MTF: {mtf_align}", font=ctk.CTkFont(size=10), text_color=TEXT_SECONDARY).pack(side="left")
+        
+        # Market Structure & Trend
+        struct_info = signal_data.get('market_structure', {})
+        trend_strength = signal_data.get('trend_strength', 'UNKNOWN')
+        
+        struct_row = ctk.CTkFrame(details_frame, fg_color="transparent")
+        struct_row.pack(fill="x", pady=(0, 4))
+        
+        structure = struct_info.get('structure', 'NEUTRAL')
+        struct_emoji = "📈" if 'BULLISH' in structure else ("📉" if 'BEARISH' in structure else "➡️")
+        
+        ctk.CTkLabel(struct_row, text=f"{struct_emoji} Structure: {structure}", font=ctk.CTkFont(size=10), text_color=TEXT_SECONDARY).pack(side="left")
+        ctk.CTkLabel(struct_row, text=f"  |  🔥 Trend: {trend_strength}", font=ctk.CTkFont(size=10), text_color=TEXT_SECONDARY).pack(side="left")
+        
+        # Multiple Take Profits Display
+        take_profits = signal_data.get('take_profits', {})
+        if take_profits:
+            tp_row = ctk.CTkFrame(details_frame, fg_color=BG_HOVER, corner_radius=6)
+            tp_row.pack(fill="x", pady=(4, 4))
+            
+            tp1 = take_profits.get('tp1', {}).get('price', 'N/A')
+            tp2 = take_profits.get('tp2', {}).get('price', 'N/A')
+            tp3 = take_profits.get('tp3', {}).get('price', 'N/A')
+            
+            tp_inner = ctk.CTkFrame(tp_row, fg_color="transparent")
+            tp_inner.pack(fill="x", padx=8, pady=4)
+            
+            ctk.CTkLabel(tp_inner, text=f"🎯 TP1: {tp1} (50%)", font=ctk.CTkFont(size=10), text_color=SUCCESS_GREEN).pack(side="left", padx=(0, 8))
+            ctk.CTkLabel(tp_inner, text=f"🎯 TP2: {tp2} (30%)", font=ctk.CTkFont(size=10), text_color=SUCCESS_GREEN).pack(side="left", padx=(0, 8))
+            ctk.CTkLabel(tp_inner, text=f"🎯 TP3: {tp3} (20%)", font=ctk.CTkFont(size=10), text_color=SUCCESS_GREEN).pack(side="left")
+
+        # --- TECHNICAL ANALYSIS ROW (Scrolling Tags) ---
+        tech_scroll = ctk.CTkScrollableFrame(details_frame, height=35, orientation="horizontal", fg_color="transparent")
+        tech_scroll.pack(fill="x", pady=(0, 2))
+        
+        # Extract technicals for display
+        details = signal_data.get('details', {})
         tech_score = signal_data.get('technical_score', 0.0)
-        ml_conf = signal_data.get('ml_confidence') # Can be None
-        ml_conf_str = f"{ml_conf:.2f}" if ml_conf is not None else "N/A"
-        adv_analysis = signal_data.get('advanced_analysis', {})
-        adv_strength = adv_analysis.get('signal_strength', 'N/A')
-        size_factor = signal_data.get('position_size_factor', 1.0)
-
-        # Get entry strategy information with better defaults
-        best_strategy = signal_data.get('entry_recommendation', {}).get('best_strategy', 'No Strategy')
-        action = signal_data.get('action', 'WAIT')
-        if action is None or action == 'N/A':
-            action = 'WAIT'  # Replace None or N/A with WAIT
-        action_confidence = signal_data.get('entry_recommendation', {}).get('confidence', 0.0)
-        action_confidence_str = f"{action_confidence:.2f}" if isinstance(action_confidence, (int, float)) else action_confidence
-        risk_level = signal_data.get('entry_recommendation', {}).get('quality', 'UNKNOWN')
+        ml_conf = signal_data.get('ml_confidence')
         
-        # Format the entry information
-        entry_info = f"Strategy: {best_strategy} | Action: {action} | Conf: {action_confidence_str} | Risk: {risk_level}"
+        # Helper for tech tags
+        def add_tech_tag(label, value, color=BG_HOVER):
+            t = ctk.CTkFrame(tech_scroll, fg_color=color, corner_radius=6)
+            t.pack(side="left", padx=(0, 6))
+            ctk.CTkLabel(t, text=f"{label}: {value}", font=ctk.CTkFont(size=10, weight="bold"), text_color=TEXT_SECONDARY).pack(padx=6, pady=2)
 
-        line1_text = f"{ts_str} | {recommendation.ljust(12)} | Strength: {adv_strength: >5}"
-        line2_text = (f"Conf: {conf:.2f} (T:{tech_score:.2f}, M:{ml_conf_str}) | SizeF: {size_factor:.2f}") # Added Size Factor
+        # Add tags
+        add_tech_tag("Strength", f"{tech_score:.1f}/5.0", color=BG_DARK)
+        if ml_conf is not None:
+             add_tech_tag("AI Conf", f"{ml_conf:.0%}", color=BG_DARK)
+             
+        add_tech_tag("RSI", details.get('rsi', '?'))
+        add_tech_tag("MACD", details.get('macd_h', '?'))
+        add_tech_tag("ADX", details.get('adx', '?'))
+        add_tech_tag("ATR", details.get('atr%', '?'))
+
+        # --- FOOTER (ACTION) ---
+        show_exec = "STRONG" not in recommendation 
         
-        # Add entry time to line3 if available
-        entry_time_str = signal_data.get('entry_time', "")
-        if entry_time_str:
-            line3_text = f"Entry: {entry} | Entry Time: {entry_time_str} | SL: {sl} | TP: {tp}"
+        if show_exec:
+            footer = ctk.CTkFrame(card, fg_color="transparent")
+            footer.pack(fill="x", padx=16, pady=(4, 16))
+            
+            exec_btn = ctk.CTkButton(
+                footer,
+                text="⚡ Execute Trade",
+                font=BOLD_FONT,
+                fg_color=accent_color,
+                hover_color=accent_color,
+                height=32,
+                corner_radius=8,
+                command=lambda s=signal_data: self._manual_execute_trade(s)
+            )
+            exec_btn.pack(fill="x")
         else:
-            line3_text = f"Entry: {entry} | SL: {sl} | TP: {tp}"
+            ctk.CTkFrame(card, fg_color="transparent", height=10).pack()
+
+        # Save widget references for updates
+        self.last_signals[signal_key] = {
+            "frame": card,
+            "entry_time_label": entry_time_label
+        }
         
-        # Add entry strategy information to line4
-        line4_text = entry_info
-        
-        # Add technical details to line5
-        line5_text = f"Details: {details_str}"
+        if not hasattr(self, 'signal_widgets'):
+            self.signal_widgets = []
+            
+        self.signal_widgets.append(card)
 
-        # Determine if this signal should get a manual execution button
-        show_manual_execution = "STRONG_BUY" not in recommendation and "STRONG_SELL" not in recommendation
-
-        if signal_key in self.last_signals:
-            if len(self.last_signals[signal_key]) == 5:  # Old format without button
-                frame, label_pair_tf, label_line1, label_line2, label_line3 = self.last_signals[signal_key]
-                # Remove old frame and create a new one with the button if needed
-                frame.destroy()
-                frame = ctk.CTkFrame(self.signals_scroll_frame, fg_color=bg_color, corner_radius=5, border_width=1, border_color="gray40")
-                frame.pack(fill="x", padx=5, pady=(3, 0))
-                frame.grid_columnconfigure(0, weight=1)
+        # Enforce display limit
+        limit = self.config.get("bot_settings", {}).get("signal_display_limit", 30)
+        if len(self.signal_widgets) > limit:
+            widget_to_remove = self.signal_widgets.pop(0)
+            
+            # Clean up from last_signals map too
+            key_to_remove = None
+            for key, widgets in list(self.last_signals.items()):
+                # Handle both new dict and old tuple formats
+                if isinstance(widgets, dict) and widgets.get('frame') == widget_to_remove:
+                    key_to_remove = key
+                    break
+                elif isinstance(widgets, tuple) and widgets[0] == widget_to_remove:
+                    key_to_remove = key
+                    break
+            
+            if key_to_remove:
+                del self.last_signals[key_to_remove]
                 
-                label_pair_tf = ctk.CTkLabel(frame, text=pair_tf_text, font=ctk.CTkFont(size=14, weight="bold"), anchor="w")
-                label_pair_tf.grid(row=0, column=0, padx=8, pady=(4, 0), sticky="ew")
-                label_line1 = ctk.CTkLabel(frame, text=line1_text, anchor="w", justify="left", font=ctk.CTkFont(size=11))
-                label_line1.grid(row=1, column=0, padx=8, pady=(0, 0), sticky="ew")
-                label_line2 = ctk.CTkLabel(frame, text=line2_text, anchor="w", justify="left", font=ctk.CTkFont(size=11))
-                label_line2.grid(row=2, column=0, padx=8, pady=(0, 0), sticky="ew")
-                label_line3 = ctk.CTkLabel(frame, text=line3_text, anchor="w", justify="left", font=ctk.CTkFont(size=11))
-                label_line3.grid(row=3, column=0, padx=8, pady=(0, 0), sticky="ew")
-                label_line4 = ctk.CTkLabel(frame, text=line4_text, anchor="w", justify="left", font=ctk.CTkFont(size=11))
-                label_line4.grid(row=4, column=0, padx=8, pady=(0, 0), sticky="ew")
-                label_line5 = ctk.CTkLabel(frame, text=line5_text, anchor="w", justify="left", font=ctk.CTkFont(size=10), text_color="gray80")
-                label_line5.grid(row=5, column=0, padx=8, pady=(0, 4), sticky="ew")
-                
-                # Add execute button if needed
-                if show_manual_execution:
-                    exec_button = ctk.CTkButton(
-                        frame, 
-                        text="Execute Trade", 
-                        width=110, 
-                        height=24,
-                        font=ctk.CTkFont(size=10),
-                        command=lambda s=signal_data: self._manual_execute_trade(s)
-                    )
-                    exec_button.grid(row=6, column=0, padx=8, pady=(0, 6), sticky="e")
-                    self.last_signals[signal_key] = (frame, label_pair_tf, label_line1, label_line2, label_line3, label_line4, label_line5, exec_button)
-                else:
-                    self.last_signals[signal_key] = (frame, label_pair_tf, label_line1, label_line2, label_line3, label_line4, label_line5)
-            else:  # Updated format with or without button
-                frame, label_pair_tf, label_line1, label_line2, label_line3, label_line4, *rest = self.last_signals[signal_key]
-                
-                # Check if we have label_line5 in the tuple
-                if len(rest) > 0 and isinstance(rest[0], ctk.CTkLabel):
-                    label_line5 = rest[0]
-                    rest = rest[1:]
-                else:
-                    # Create label_line5 if it doesn't exist
-                    label_line5 = ctk.CTkLabel(frame, text=line5_text, anchor="w", justify="left", font=ctk.CTkFont(size=10), text_color="gray80")
-                    label_line5.grid(row=5, column=0, padx=8, pady=(0, 4), sticky="ew")
-                
-                frame.configure(fg_color=bg_color)
-                label_pair_tf.configure(text=pair_tf_text)
-                label_line1.configure(text=line1_text)
-                label_line2.configure(text=line2_text)
-                label_line3.configure(text=line3_text)
-                label_line4.configure(text=line4_text)
-                label_line5.configure(text=line5_text)
-                    
-                # Handle button if it exists
-                if rest and show_manual_execution:
-                    # Button already exists, update command with new signal data
-                    rest[0].configure(command=lambda s=signal_data: self._manual_execute_trade(s))
-                elif rest and not show_manual_execution:
-                    # Button exists but should be removed
-                    rest[0].destroy()
-                    self.last_signals[signal_key] = (frame, label_pair_tf, label_line1, label_line2, label_line3, label_line4, label_line5)
-                elif not rest and show_manual_execution:
-                    # Need to add a button
-                    exec_button = ctk.CTkButton(
-                        frame, 
-                        text="Execute Trade", 
-                        width=110, 
-                        height=24,
-                        font=ctk.CTkFont(size=10),
-                        command=lambda s=signal_data: self._manual_execute_trade(s)
-                    )
-                    exec_button.grid(row=6, column=0, padx=8, pady=(0, 6), sticky="e")
-                    self.last_signals[signal_key] = (frame, label_pair_tf, label_line1, label_line2, label_line3, label_line4, label_line5, exec_button)
-                
-                frame.pack_forget()
-                frame.pack(fill="x", padx=5, pady=(3, 0))
-        else:
-            frame = ctk.CTkFrame(self.signals_scroll_frame, fg_color=bg_color, corner_radius=5, border_width=1, border_color="gray40")
-            frame.pack(fill="x", padx=5, pady=(3, 0))
-            frame.grid_columnconfigure(0, weight=1)
-            
-            label_pair_tf = ctk.CTkLabel(frame, text=pair_tf_text, font=ctk.CTkFont(size=14, weight="bold"), anchor="w")
-            label_pair_tf.grid(row=0, column=0, padx=8, pady=(4, 0), sticky="ew")
-            
-            label_line1 = ctk.CTkLabel(frame, text=line1_text, anchor="w", justify="left", font=ctk.CTkFont(size=11))
-            label_line1.grid(row=1, column=0, padx=8, pady=(0, 0), sticky="ew")
-            
-            label_line2 = ctk.CTkLabel(frame, text=line2_text, anchor="w", justify="left", font=ctk.CTkFont(size=11))
-            label_line2.grid(row=2, column=0, padx=8, pady=(0, 0), sticky="ew")
-            
-            label_line3 = ctk.CTkLabel(frame, text=line3_text, anchor="w", justify="left", font=ctk.CTkFont(size=11))
-            label_line3.grid(row=3, column=0, padx=8, pady=(0, 0), sticky="ew")
-            
-            label_line4 = ctk.CTkLabel(frame, text=line4_text, anchor="w", justify="left", font=ctk.CTkFont(size=11))
-            label_line4.grid(row=4, column=0, padx=8, pady=(0, 0), sticky="ew")
-            
-            label_line5 = ctk.CTkLabel(frame, text=line5_text, anchor="w", justify="left", font=ctk.CTkFont(size=10), text_color="gray80")
-            label_line5.grid(row=5, column=0, padx=8, pady=(0, 4), sticky="ew")
-            
-            if show_manual_execution:
-                exec_button = ctk.CTkButton(
-                    frame, 
-                    text="Execute Trade", 
-                    width=110, 
-                    height=24,
-                    font=ctk.CTkFont(size=10),
-                    command=lambda s=signal_data: self._manual_execute_trade(s)
-                )
-                exec_button.grid(row=6, column=0, padx=8, pady=(0, 6), sticky="e")
-                self.last_signals[signal_key] = (frame, label_pair_tf, label_line1, label_line2, label_line3, label_line4, label_line5, exec_button)
-            else:
-                self.last_signals[signal_key] = (frame, label_pair_tf, label_line1, label_line2, label_line3, label_line4, label_line5)
-
-            self.signal_widgets.append(frame)
-
-            limit = self.config.get("bot_settings", {}).get("signal_display_limit", 30)
-            if len(self.signal_widgets) > limit:
-                widget_to_remove = self.signal_widgets.pop(0)
-                key_to_remove = None
-                for key, (frm, *_) in self.last_signals.items():
-                     if frm == widget_to_remove: key_to_remove = key; break
-                if key_to_remove: del self.last_signals[key_to_remove]
-                widget_to_remove.destroy()
+            widget_to_remove.destroy()
 
     def _manual_execute_trade(self, signal_data: Dict):
         """Handle manual execution of a trade from the signal UI"""
@@ -997,6 +1957,13 @@ class TradingApp(ctk.CTk):
                 logger.warning(f"Failed to select symbol {pair} in Market Watch. Error: {mt5.last_error()}")
                 messagebox.showwarning("Symbol Selection", f"Failed to select {pair} in Market Watch. The trade may fail.")
             
+            # Update entry price with live data if missing (for manual execution)
+            if signal_data.get('entry_price', 0.0) == 0.0:
+                tick = mt5.symbol_info_tick(pair)
+                if tick:
+                    current_price = tick.ask if direction == "BUY" else tick.bid
+                    signal_data['entry_price'] = current_price
+
             confirm = messagebox.askyesno(
                 "Confirm Manual Execution", 
                 f"Execute {direction} trade for {pair}?\n\n" +
@@ -1167,7 +2134,7 @@ class TradingApp(ctk.CTk):
                                     ).start()
                                     
                                     # Switch to the Positions tab to show the new position
-                                    self.dashboard_tab_view.set("Positions")
+                                    self.tab_view.set("📈 Positions")
                                 else:
                                     logger.warning("Could not add position to execution manager (not available)")
                                     messagebox.showwarning("Trade Not Tracked", 
@@ -1186,7 +2153,27 @@ class TradingApp(ctk.CTk):
                                           f"Volume: {volume}")
                         
                         # Switch to the Positions tab
-                        self.tab_view.set("Open Positions")
+                        self.tab_view.set("📈 Positions")
+                    
+                    elif result.retcode == 10027: # AUTO_TRADING_DISABLED
+                        logger.error("MT5 Error 10027: AutoTrading disabled by client")
+                        messagebox.showerror("Algo Trading Disabled", 
+                            "⚠️ Failed to execute trade: Algo Trading is disabled in MT5.\n\n"
+                            "To fix this:\n"
+                            "1. Go to your MetaTrader 5 terminal.\n"
+                            "2. Look for the 'Algo Trading' button in the top toolbar.\n"
+                            "3. Click it to enable it (should turn green/prominent).\n"
+                            "4. Try executing the trade again.")
+                            
+                    elif result.retcode == 10016: # INVALID_STOPS
+                        logger.error("MT5 Error 10016: Invalid Stops")
+                        messagebox.showerror("Invalid Stops", 
+                            f"⚠️ Failed to execute trade: Invalid Stop Loss or Take Profit.\n\n"
+                            f"Entry: {price}\n"
+                            f"SL: {sl}\n"
+                            f"TP: {tp}\n\n"
+                            "Ensure SL/TP levels are valid relative to current price and minimum stop distance.")
+
                     else:
                         error_msg = f"MT5 Error: {result.retcode} - {result.comment}"
                         logger.warning(f"Direct MT5 order failed: {error_msg}")
@@ -1381,73 +2368,6 @@ class TradingApp(ctk.CTk):
             # Clean up tracking on error
             if hasattr(self, 'execution_manager') and self.execution_manager and ticket in self.execution_manager.open_positions:
                 del self.execution_manager.open_positions[ticket]
-                
-    def _update_positions_tab(self):
-        """Update the open positions tab with current positions from MT5"""
-        try:
-            if not self.execution_manager:
-                return
-            
-            # Direct MT5 call to get positions with more debug information
-            if mt5 is None or not mt5.initialize():
-                # تقليل تكرار رسائل التحذير - عدم تسجيل تحذير في كل مرة
-                if not hasattr(self, '_last_mt5_warning_time') or time.time() - self._last_mt5_warning_time > 60:
-                    logger.warning("MT5 not initialized for position check")
-                    self._last_mt5_warning_time = time.time()
-                
-                pos_text = f"--- Open Positions ({datetime.now().strftime('%H:%M:%S')}) ---\n\n"
-                pos_text += "MetaTrader 5 غير متصل. اضغط على 'Connect' للاتصال بـ MT5.\n\n"
-                pos_text += "⚠️ لتنفيذ الصفقات وعرض المراكز المفتوحة، يجب الاتصال بـ MT5.\n"
-                pos_text += "   1. تأكد من أن برنامج MetaTrader 5 مفتوح\n"
-                pos_text += "   2. اضغط على زر 'Connect' أعلى يسار الشاشة\n"
-                pos_text += "   3. تأكد من صحة بيانات الدخول في الإعدادات\n"
-            else:
-                # Get positions directly from MT5 instead of through execution_manager
-                logger.debug("Fetching positions directly from MT5")
-                mt5_positions = mt5.positions_get()
-                
-                if mt5_positions is None:
-                    mt5_error = mt5.last_error()
-                    logger.warning(f"Failed to get positions from MT5: {mt5_error}")
-                    pos_text = f"--- Open Positions ({datetime.now().strftime('%H:%M:%S')}) ---\n\nError fetching positions: {mt5_error}"
-                elif len(mt5_positions) == 0:
-                    logger.info("No open positions found in MT5")
-                    pos_text = f"--- Open Positions ({datetime.now().strftime('%H:%M:%S')}) ---\n\n(No open positions)"
-                else:
-                    # Format positions data from MT5 directly
-                    pos_text = f"--- Open Positions ({datetime.now().strftime('%H:%M:%S')}) ---\n\n"
-                    pos_text += "{:<10} {:<12} {:<6} {:<8} {:<12} {:<12} {:<12} {:<12}\n".format(
-                        "Ticket", "Symbol", "Type", "Volume", "Entry Price", "SL", "TP", "Profit"
-                    )
-                    pos_text += "-" * 95 + "\n"
-                    
-                    for pos in mt5_positions:
-                        pos_type = "BUY" if pos.type == mt5.POSITION_TYPE_BUY else "SELL"
-                        entry_time = datetime.fromtimestamp(pos.time).strftime('%Y-%m-%d %H:%M')
-                        
-                        pos_text += "{:<10} {:<12} {:<6} {:<8.2f} {:<12.5f} {:<12.5f} {:<12.5f} {:<12.2f}\n".format(
-                            pos.ticket,
-                            pos.symbol,
-                            pos_type,
-                            pos.volume,
-                            pos.price_open,
-                            pos.sl,
-                            pos.tp,
-                            pos.profit
-                        )
-                        
-                    logger.info(f"Found {len(mt5_positions)} open positions in MT5")
-            
-            # Update the UI with position data
-            if hasattr(self, 'positions_textbox'):
-                self.positions_textbox.configure(state=tk.NORMAL)
-                self.positions_textbox.delete("1.0", tk.END)
-                self.positions_textbox.insert("1.0", pos_text)
-                self.positions_textbox.configure(state=tk.DISABLED)
-                
-            logger.debug("Positions tab updated with direct MT5 data")
-        except Exception as e:
-            logger.exception(f"Error updating positions tab: {e}")
 
     def _clear_signals_display(self):
         """Removes all signal frames from the display area."""
@@ -1474,51 +2394,131 @@ class TradingApp(ctk.CTk):
 
     # --- Market Summary Display (Keep as is) ---
     def _update_summary_display(self, summary_data: Dict):
-        logger.debug("Updating market summary display.")
+        """Updates the market summary tab with visual cards."""
+        logger.debug("Updating market summary display with visual cards.")
         try:
-            self.summary_textbox.configure(state=tk.NORMAL)
-            self.summary_textbox.delete("1.0", tk.END)
+            # Update timestamp
             ts = summary_data.get('timestamp', 'N/A')
-            try: ts_dt = datetime.fromisoformat(ts).astimezone(self.signal_generator.timezone); ts_str = ts_dt.strftime('%Y-%m-%d %H:%M:%S %Z')
-            except: ts_str = ts
-            summary_str = f"--- Market Summary ({ts_str}) ---\n\n"
-            mood = summary_data.get('market_mood', 'N/A').replace('_', ' ').title()
-            summary_str += f"Overall Market Mood:  {mood}\n"
-            if summary_data.get('crypto_fear_greed'):
-                fg = summary_data['crypto_fear_greed']
-                summary_str += f"Crypto Fear & Greed:  {fg.get('value')} ({fg.get('interpretation', 'N/A')})\n"
-            summary_str += "\n--- Upcoming High Impact Events (Next ~2 Days) ---\n"
-            events = summary_data.get('high_impact_events', [])
-            if events:
-                for event in events:
-                     impact_stars = "*" * event.get('impact', 0); country_code = event.get('country', '?')[:3].upper()
-                     summary_str += (f"- {event.get('date')} {event.get('time_utc')} UTC | {country_code.ljust(3)} | {event.get('event', '?')} ({impact_stars})\n")
-            else: summary_str += "(None significant found)\n"
-            summary_str += "\n--- Pair Sentiment & News Analysis ---\n"
+            try: 
+                ts_dt = datetime.fromisoformat(ts).astimezone(self.signal_generator.timezone)
+                ts_str = ts_dt.strftime('%H:%M:%S')
+            except: 
+                ts_str = ts
+            self.market_update_label.configure(text=f"Updated: {ts_str}")
+            
+            # Market Mood with color
+            mood = summary_data.get('market_mood', 'neutral')
+            mood_display = mood.replace('_', ' ').title()
+            if 'bullish' in mood.lower():
+                mood_color = SUCCESS_GREEN
+            elif 'bearish' in mood.lower():
+                mood_color = DANGER_RED
+            else:
+                mood_color = WARNING_YELLOW
+            self._update_stat_card(self.market_mood_card, mood_display, mood_color)
+            
+            # Calculate overall sentiment from pairs
             pairs_data = summary_data.get('pairs', {})
+            total_sentiment = 0.0
+            total_news = 0
+            for pair, data in pairs_data.items():
+                sentiment_info = data.get('sentiment', {})
+                total_sentiment += sentiment_info.get('sentiment_score', 0)
+                total_news += sentiment_info.get('news_count', 0)
+            
+            avg_sentiment = total_sentiment / len(pairs_data) if pairs_data else 0.0
+            sent_color = SUCCESS_GREEN if avg_sentiment > 0.05 else DANGER_RED if avg_sentiment < -0.05 else TEXT_SECONDARY
+            self._update_stat_card(self.sentiment_score_card, f"{avg_sentiment:+.2f}", sent_color)
+            self._update_stat_card(self.news_count_card, str(total_news), ACCENT_BLUE)
+            
+            # Clear existing pair cards
+            for widget in self.market_pairs_frame.winfo_children():
+                if widget != self.market_placeholder:
+                    widget.destroy()
+            
             if pairs_data:
-                 for pair, data in pairs_data.items():
-                     sentiment_info = data.get('sentiment', {})
-                     sent_label = sentiment_info.get('sentiment', 'N/A').upper(); sent_score = sentiment_info.get('sentiment_score', 'N/A'); sent_conf = sentiment_info.get('confidence', 'N/A')
-                     news_list = sentiment_info.get('recent_news', [])
-                     summary_str += f"\n[{pair}]\n  Sentiment: {sent_label} (Score: {sent_score}, Conf: {sent_conf})\n"
-                     if news_list:
-                         summary_str += "  Recent News:\n"
-                         for news in news_list:
-                             news_sent = news.get('sentiment', {}); sent_news_label = news_sent.get('sentiment_label', 'neu')[:3]; sent_news_score = news_sent.get('combined_score', 0)
-                             source = news.get('source', 'Src')[:10]; title = news.get('title', '?')[:75] + ('...' if len(news.get('title', '')) > 75 else '')
-                             summary_str += f"    - [{source}][{sent_news_label}:{sent_news_score:+.1f}] {title}\n"
-                     else: summary_str += "  Recent News: (None relevant found)\n"
-                     if data.get('error'): summary_str += f"  ! Error fetching sentiment: {data['error']}\n"
-            else: summary_str += "(No specific pair analysis available)\n"
-            if summary_data.get('error'): summary_str += f"\n\n*** SUMMARY GENERATION ERROR: {summary_data['error']} ***"
-            self.summary_textbox.insert("1.0", summary_str)
-            self.summary_textbox.configure(state=tk.DISABLED)
+                # Hide placeholder
+                if self.market_placeholder.winfo_ismapped():
+                    self.market_placeholder.pack_forget()
+                
+                # Create pair cards
+                for pair, data in pairs_data.items():
+                    self._create_market_pair_card(pair, data)
+            else:
+                # Show placeholder
+                if not self.market_placeholder.winfo_ismapped():
+                    self.market_placeholder.pack(pady=30)
+                    
         except Exception as e:
-             logger.exception(f"Error updating market summary display: {e}")
-             try:
-                 self.summary_textbox.delete("1.0", tk.END); self.summary_textbox.insert("1.0", f"Error rendering summary:\n{e}"); self.summary_textbox.configure(state=tk.DISABLED)
-             except: pass
+            logger.exception(f"Error updating market summary display: {e}")
+    
+    def _create_market_pair_card(self, pair: str, data: Dict):
+        """Creates a visual card for a currency pair's market analysis."""
+        sentiment_info = data.get('sentiment', {})
+        sent_label = sentiment_info.get('sentiment', 'neutral').upper()
+        sent_score = sentiment_info.get('sentiment_score', 0)
+        news_count = sentiment_info.get('news_count', 0)
+        
+        # Trade recommendation
+        trade_rec = data.get('trade_recommendation', {})
+        action = trade_rec.get('action', 'HOLD')
+        
+        # Determine colors
+        if 'BUY' in action:
+            border_color = SUCCESS_GREEN
+            action_text = f"🟢 {action.replace('_', ' ')}"
+        elif 'SELL' in action:
+            border_color = DANGER_RED
+            action_text = f"🔴 {action.replace('_', ' ')}"
+        else:
+            border_color = WARNING_YELLOW
+            action_text = f"⚪ HOLD"
+        
+        # Main card
+        card = ctk.CTkFrame(self.market_pairs_frame, fg_color=BG_CARD, corner_radius=16, border_width=1, border_color=BORDER_COLOR)
+        card.pack(fill="x", padx=0, pady=(0, 10))
+        
+        # Left indicator
+        indicator = ctk.CTkFrame(card, width=5, fg_color=border_color, corner_radius=4)
+        indicator.grid(row=0, column=0, rowspan=2, sticky="ns", padx=(0, 0), pady=10)
+        
+        # Content
+        content = ctk.CTkFrame(card, fg_color="transparent")
+        content.grid(row=0, column=1, sticky="nsew", padx=12, pady=10)
+        content.grid_columnconfigure(0, weight=1)
+        card.grid_columnconfigure(1, weight=1)
+        
+        # Top row: Pair and action
+        top_row = ctk.CTkFrame(content, fg_color="transparent")
+        top_row.pack(fill="x")
+        top_row.grid_columnconfigure(0, weight=1)
+        
+        pair_label = ctk.CTkLabel(
+            top_row,
+            text=pair,
+            font=SUBHEADER_FONT,
+            text_color=TEXT_PRIMARY
+        )
+        pair_label.grid(row=0, column=0, sticky="w")
+        
+        action_label = ctk.CTkLabel(
+            top_row,
+            text=action_text,
+            font=BOLD_FONT,
+            text_color=border_color
+        )
+        action_label.grid(row=0, column=1, sticky="e")
+        
+        # Sentiment info
+        sent_emoji = "📈" if sent_score > 0.05 else "📉" if sent_score < -0.05 else "➡️"
+        
+        details_label = ctk.CTkLabel(
+            content,
+            text=f"{sent_emoji} Sentiment: {sent_label} ({sent_score:+.2f}) | 📰 {news_count} news",
+            font=MAIN_FONT,
+            text_color=TEXT_SECONDARY
+        )
+        details_label.pack(fill="x", anchor="w", pady=(4, 0))
 
 
     # --- Bot Control Logic (Main Loop) ---
@@ -1900,9 +2900,9 @@ class TradingApp(ctk.CTk):
         self.bot_status_label.configure(text="Status: Running", text_color="lightgreen")
         self.start_button.configure(state=tk.DISABLED)
         self.stop_button.configure(state=tk.NORMAL)
-        self.entry_pairs.configure(state=tk.DISABLED)
-        self.entry_timeframes.configure(state=tk.DISABLED)
-        self.save_config_button.configure(state=tk.DISABLED)
+        # self.entry_pairs.configure(state=tk.DISABLED) # Widget Removed
+        # self.entry_timeframes.configure(state=tk.DISABLED) # Widget Removed
+        # self.save_config_button.configure(state=tk.DISABLED) # Widget Removed
 
         logger.info("Starting bot analysis loop thread...")
         self.status_bar.set_status("Bot starting...", priority=True)
@@ -1927,13 +2927,22 @@ class TradingApp(ctk.CTk):
          self.bot_status_label.configure(text="Status: Stopped", text_color="gray")
          self.start_button.configure(state=tk.NORMAL)
          self.stop_button.configure(state=tk.DISABLED)
-         self.entry_pairs.configure(state=tk.NORMAL)
-         self.entry_timeframes.configure(state=tk.NORMAL)
-         self.save_config_button.configure(state=tk.NORMAL)
+         # self.entry_pairs.configure(state=tk.NORMAL) # Widget Removed
+         # self.entry_timeframes.configure(state=tk.NORMAL) # Widget Removed
+         # self.save_config_button.configure(state=tk.NORMAL) # Widget Removed
          self.status_bar.set_status("Bot stopped.")
          self.status_bar.hide_progress()
          logger.info("Bot stop confirmed and UI updated.")
 
+
+    def open_settings(self):
+        """Opens the Settings Modal Dialog."""
+        try:
+            # Pass current config and callback to save
+            SettingsDialog(self, self.config, self._save_config)
+        except Exception as e:
+             logger.error(f"Failed to open settings: {e}")
+             messagebox.showerror("Error", f"Could not open settings: {e}")
 
     def on_closing(self):
         """Handles the window closing event to ensure graceful shutdown."""
@@ -2392,26 +3401,139 @@ class TradingApp(ctk.CTk):
             messagebox.showerror("Export Error", error_message)
             logger.exception(error_message)
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # RISK MANAGEMENT & TRADE CONTROL
+    # ═══════════════════════════════════════════════════════════════════════════
+    def _emergency_close_all(self):
+        """Emergency close all open positions."""
+        if not messagebox.askyesno("Emergency Close", 
+            "⚠️ Are you sure you want to CLOSE ALL POSITIONS?\n\n"
+            "This will immediately close all open trades."):
+            return
+        
+        if not self.data_manager or not self.data_manager.is_initialized:
+            messagebox.showerror("Error", "MT5 not connected")
+            return
+        
+        try:
+            positions = mt5.positions_get()
+            if not positions:
+                messagebox.showinfo("Info", "No open positions to close.")
+                return
+            
+            closed = 0
+            failed = 0
+            
+            for pos in positions:
+                tick = mt5.symbol_info_tick(pos.symbol)
+                if not tick:
+                    failed += 1
+                    continue
+                    
+                price = tick.bid if pos.type == 0 else tick.ask
+                
+                request = {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "symbol": pos.symbol,
+                    "volume": pos.volume,
+                    "type": mt5.ORDER_TYPE_SELL if pos.type == 0 else mt5.ORDER_TYPE_BUY,
+                    "position": pos.ticket,
+                    "price": price,
+                    "deviation": 30,
+                    "magic": 999999,
+                    "comment": "EMERGENCY_CLOSE",
+                    "type_time": mt5.ORDER_TIME_GTC,
+                    "type_filling": mt5.ORDER_FILLING_IOC,
+                }
+                
+                result = mt5.order_send(request)
+                if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                    closed += 1
+                else:
+                    failed += 1
+            
+            messagebox.showinfo("Emergency Close", 
+                f"✅ Closed: {closed} positions\n❌ Failed: {failed} positions")
+            logger.warning(f"Emergency close: {closed} closed, {failed} failed")
+            
+            # Update dashboard
+            self._update_risk_dashboard()
+            
+        except Exception as e:
+            logger.exception(f"Emergency close error: {e}")
+            messagebox.showerror("Error", f"Emergency close failed: {e}")
 
-# --- Custom Status Bar Class (Keep as is) ---
+    def _update_risk_dashboard(self):
+        """Update the risk dashboard with current data."""
+        try:
+            # Daily P&L
+            if self.data_manager and self.data_manager.is_initialized:
+                today_pnl = 0.0
+                positions = mt5.positions_get()
+                pos_count = len(positions) if positions else 0
+                total_lots = sum(p.volume for p in positions) if positions else 0
+                
+                # Get floating P&L
+                if positions:
+                    today_pnl = sum(p.profit for p in positions)
+                
+                # Update labels
+                pnl_color = SUCCESS_GREEN if today_pnl >= 0 else DANGER_RED
+                self.daily_pnl_label.configure(
+                    text=f"${today_pnl:+,.2f}", 
+                    text_color=pnl_color
+                )
+                self.open_positions_label.configure(text=str(pos_count))
+                self.exposure_label.configure(text=f"{total_lots:.2f} lots")
+            
+            # Auto-Trade status
+            if hasattr(self, 'execution_manager') and self.execution_manager:
+                config = self.execution_manager.config
+                if config.get('auto_trade_enabled', False):
+                    self.auto_trade_label.configure(text="● ON", text_color=SUCCESS_GREEN)
+                else:
+                    self.auto_trade_label.configure(text="● OFF", text_color=TEXT_SECONDARY)
+            
+            # Guardian status (placeholder - would need guardian instance)
+            # self.guardian_label.configure(text="● ACTIVE", text_color=SUCCESS_GREEN)
+            
+        except Exception as e:
+            logger.debug(f"Risk dashboard update error: {e}")
+
+
+# --- Custom Status Bar Class - Modern Theme ---
 class StatusBar(ctk.CTkFrame):
     """A custom status bar widget with text label and optional progress bar."""
     def __init__(self, master, *args, **kwargs):
-        super().__init__(master, *args, fg_color="transparent", **kwargs) # Transparent background
-        self.configure(height=25) # Fixed height
-        self.status_label = ctk.CTkLabel(self, text="Ready", anchor="w", font=ctk.CTkFont(size=12))
-        self.status_label.grid(row=0, column=0, sticky="ew", padx=(10, 5))
-        self.progress_bar = ctk.CTkProgressBar(self, width=150, height=15, corner_radius=8)
+        super().__init__(master, *args, fg_color=BG_CARD, corner_radius=8, **kwargs)
+        self.configure(height=30)
+        self.status_label = ctk.CTkLabel(
+            self, 
+            text="🟢 Ready", 
+            anchor="w", 
+            font=ctk.CTkFont(size=11),
+            text_color=TEXT_SECONDARY
+        )
+        self.status_label.grid(row=0, column=0, sticky="ew", padx=(12, 5), pady=5)
+        self.progress_bar = ctk.CTkProgressBar(
+            self, 
+            width=150, 
+            height=12, 
+            corner_radius=6,
+            fg_color=BG_DARK,
+            progress_color=ACCENT_TEAL
+        )
         self.progress_bar.set(0)
-        self.progress_bar.grid(row=0, column=1, sticky="e", padx=(5, 10)); self.progress_bar.grid_remove()
+        self.progress_bar.grid(row=0, column=1, sticky="e", padx=(5, 12), pady=5)
+        self.progress_bar.grid_remove()
         self.grid_columnconfigure(0, weight=1)
         self._status_clear_timer: Optional[str] = None
-        self._permanent_message: str = "Ready"
+        self._permanent_message: str = "🟢 Ready"
 
     def set_status(self, text: str, duration: int = 0, alert: bool = False, priority: bool = False):
         """Sets the status text."""
         if self._status_clear_timer: self.after_cancel(self._status_clear_timer); self._status_clear_timer = None
-        text_color = "#FF8C00" if alert else "gray80"
+        text_color = WARNING_YELLOW if alert else TEXT_SECONDARY
         self.status_label.configure(text=text, text_color=text_color)
         if duration > 0 and not priority:
             self._status_clear_timer = self.after(duration, lambda: self.set_status(self._permanent_message))
@@ -2429,7 +3551,7 @@ class StatusBar(ctk.CTkFrame):
 
 
 # --- Main Execution Guard ---
-if __name__ == "__main__":
+def main():
     threading.current_thread().name = "MainUIThread"
     logger.info(f"Starting {APP_NAME}...")
     app = TradingApp()
@@ -2444,5 +3566,8 @@ if __name__ == "__main__":
          except Exception as close_e: logger.error(f"Error during emergency shutdown: {close_e}")
          finally: logger.critical("Forcing exit after unhandled mainloop exception."); exit(1)
     logger.info(f"{APP_NAME} finished.")
+
+if __name__ == "__main__":
+    main()
 
 # --- END OF FILE Main.py ---

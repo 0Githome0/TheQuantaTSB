@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Dict, Optional, List, Tuple, Any # <--- Make s
 # Assume ProfitabilityEnhancer exists and has calculate_position_size
 # If not, create a placeholder or implement basic logic here
 try:
-    from profitability_enhancer import ProfitabilityEnhancer
+    from src.core.profitability_enhancer import ProfitabilityEnhancer
 except ImportError:
     log_placeholder = logging.getLogger('ExecutionManager') # Need logger before potential error
     log_placeholder.warning("ProfitabilityEnhancer not found. Using placeholder logic for position sizing.")
@@ -37,9 +37,9 @@ except ImportError:
 try:
     # Use TYPE_CHECKING to avoid runtime circular dependency if ExecutionManager might be imported by tracker
     if TYPE_CHECKING:
-        from performance_tracker import PerformanceTracker
+        from src.core.performance_tracker import PerformanceTracker
     else:
-        from performance_tracker import PerformanceTracker
+        from src.core.performance_tracker import PerformanceTracker
 except ImportError:
      log_placeholder = logging.getLogger('ExecutionManager')
      log_placeholder.critical("FATAL: Could not import PerformanceTracker. ExecutionManager cannot function.")
@@ -90,7 +90,15 @@ class ExecutionManager:
         "min_lot": 0.01,
         "max_lot": 1.0,
         "symbol_mapping": {},
-        "close_on_opposite_signal": False
+        "close_on_opposite_signal": False,
+        # Auto-Trading Settings
+        "auto_trade_enabled": True,          # Master switch for auto-trading
+        "auto_trade_grades": ["A+"],          # Only auto-trade these grades
+        "auto_trade_max_per_day": 5,          # Max auto trades per day
+        "auto_trade_max_concurrent": 2,       # Max concurrent auto trades
+        "auto_trade_min_confluence": 70,      # Minimum confluence score
+        "auto_trade_require_session": True,   # Require optimal session
+        "auto_trade_require_orderflow": True  # Require orderflow confirmation
     }
 
     # --- MODIFIED __init__ ---
@@ -189,7 +197,129 @@ class ExecutionManager:
         if self.last_reset_day is None or self.last_reset_day != today:
             log.info(f"New day detected ({today}). Resetting daily trade counter from {self.daily_trade_count} to 0.")
             self.daily_trade_count = 0
+            self.auto_trade_count = 0  # Also reset auto-trade count
             self.last_reset_day = today
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # AUTO-TRADING SYSTEM
+    # ═══════════════════════════════════════════════════════════════════════════
+    def should_auto_trade(self, signal: Dict) -> Tuple[bool, str]:
+        """
+        Check if a signal qualifies for automatic trading.
+        
+        Args:
+            signal: The signal dictionary from SignalGenerator
+            
+        Returns:
+            Tuple[bool, str]: (should_auto_trade, reason)
+        """
+        # Master switch check
+        if not self.config.get('auto_trade_enabled', False):
+            return False, "Auto-trading disabled"
+        
+        # Check grade
+        grade = signal.get('grade', 'C')
+        allowed_grades = self.config.get('auto_trade_grades', ['A+'])
+        if grade not in allowed_grades:
+            return False, f"Grade {grade} not in allowed list {allowed_grades}"
+        
+        # Check auto-trade daily limit
+        max_auto = self.config.get('auto_trade_max_per_day', 5)
+        if getattr(self, 'auto_trade_count', 0) >= max_auto:
+            return False, f"Daily auto-trade limit ({max_auto}) reached"
+        
+        # Check confluence score
+        min_confluence = self.config.get('auto_trade_min_confluence', 70)
+        confluence_score = signal.get('confluence_score', 0)
+        if confluence_score and confluence_score < min_confluence:
+            return False, f"Confluence score {confluence_score} below minimum {min_confluence}"
+        
+        # Check session (if required)
+        if self.config.get('auto_trade_require_session', True):
+            session = signal.get('session', {})
+            if not session.get('is_optimal', False):
+                return False, "Not in optimal trading session"
+        
+        # Check order flow (if required)
+        if self.config.get('auto_trade_require_orderflow', True):
+            orderflow = signal.get('orderflow', {})
+            of_status = orderflow.get('status', 'NEUTRAL')
+            if of_status != 'CONFIRM':
+                return False, f"Order flow status is {of_status}, not CONFIRM"
+        
+        # Check direction is clear
+        direction = signal.get('direction')
+        if direction not in ['BUY', 'SELL']:
+            return False, f"Invalid direction: {direction}"
+        
+        # Check SL and TP are set
+        if not signal.get('stop_loss') or not signal.get('take_profit'):
+            return False, "Missing SL or TP"
+        
+        # All checks passed!
+        return True, f"Grade {grade} signal qualified for auto-trade"
+    
+    def execute_auto_trade(self, signal: Dict, trade_journal=None) -> Optional[int]:
+        """
+        Execute an automatic trade for a qualified signal.
+        
+        Args:
+            signal: The signal dictionary from SignalGenerator
+            trade_journal: Optional TradeJournal instance for recording
+            
+        Returns:
+            Optional[int]: Position ticket if successful, None otherwise
+        """
+        pair = signal.get('pair', 'UNKNOWN')
+        
+        # Double-check eligibility
+        should_trade, reason = self.should_auto_trade(signal)
+        if not should_trade:
+            log.info(f"Auto-trade rejected for {pair}: {reason}")
+            return None
+        
+        log.info(f"🤖 AUTO-TRADE: Executing {signal['direction']} on {pair} (Grade: {signal.get('grade', 'N/A')})")
+        
+        # Place the order
+        ticket = self.place_order(signal)
+        
+        if ticket:
+            # Increment auto-trade counter
+            if not hasattr(self, 'auto_trade_count'):
+                self.auto_trade_count = 0
+            self.auto_trade_count += 1
+            
+            log.info(f"🤖 AUTO-TRADE SUCCESS: {pair} Position #{ticket} (Auto trades today: {self.auto_trade_count})")
+            
+            # Record in trade journal
+            if trade_journal:
+                try:
+                    confluence = signal.get('confluence_breakdown', {})
+                    trade_journal.record_entry(
+                        ticket=ticket,
+                        signal=signal,
+                        confluence=confluence,
+                        is_auto_trade=True
+                    )
+                except Exception as e:
+                    log.error(f"Failed to record auto-trade in journal: {e}")
+            
+            return ticket
+        else:
+            log.warning(f"🤖 AUTO-TRADE FAILED: {pair} - Order placement failed")
+            return None
+    
+    def get_auto_trade_status(self) -> Dict:
+        """Get current auto-trading status and stats."""
+        return {
+            'enabled': self.config.get('auto_trade_enabled', False),
+            'allowed_grades': self.config.get('auto_trade_grades', []),
+            'auto_trades_today': getattr(self, 'auto_trade_count', 0),
+            'max_per_day': self.config.get('auto_trade_max_per_day', 5),
+            'min_confluence': self.config.get('auto_trade_min_confluence', 70),
+            'require_session': self.config.get('auto_trade_require_session', True),
+            'require_orderflow': self.config.get('auto_trade_require_orderflow', True)
+        }
 
     def _check_trade_allowed(self, pair: str) -> Tuple[bool, str]:
         """
@@ -472,12 +602,17 @@ class ExecutionManager:
         # Other codes indicate rejection or errors. See MT5 docs for all codes.
         if result.retcode != mt5.TRADE_RETCODE_DONE:
              log.error(f"Order placement failed for {pair}. RetCode: {result.retcode}, Comment: {result.comment}. Last MT5 Error: {self.mt5.last_error()}")
+             
              # Check for specific requote or price change errors
              if result.retcode in [mt5.TRADE_RETCODE_REQUOTE, mt5.TRADE_RETCODE_PRICE_CHANGED]:
                  log.warning(f"Order rejected due to price change/requote for {pair}.")
              # Check for margin issues
              elif result.retcode == mt5.TRADE_RETCODE_NO_MONEY:
                   log.error(f"Order rejected for {pair}: Insufficient funds (No Money).")
+             # Check for AutoTrading disabled (10027)
+             elif result.retcode == 10027:
+                  log.error(f"Order rejected for {pair}: AutoTrading is disabled in MT5 terminal. Please enable 'Algo Trading' button.")
+             
              return None
 
 
@@ -694,7 +829,7 @@ class ExecutionManager:
                 if not isinstance(entry_time_dt, datetime):
                      # Attempt conversion if stored as string
                      try: entry_time_dt = pd.to_datetime(stored_details.get('entry_time'), errors='coerce')
-                     except: entry_time_dt = None
+                     except Exception: entry_time_dt = None
 
                 if not entry_time_dt:
                      log.error(f"Cannot check history for position {ticket}: Invalid entry time stored.")

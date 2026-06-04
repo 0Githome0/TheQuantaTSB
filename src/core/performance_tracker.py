@@ -243,6 +243,42 @@ class PerformanceTracker:
             log.error(f"Failed to save trade history after recording trade {validated_trade.get('trade_id', 'N/A')}: {e}")
             # The trade is still in memory, just not saved to disk yet
 
+    def reset_history(self, backup: bool = True) -> bool:
+        """
+        Resets (clears) all tracked trade history.
+        
+        Args:
+            backup (bool): If True, creates a backup of the current history before resetting.
+            
+        Returns:
+            bool: True if reset was successful, False otherwise.
+        """
+        log.warning("Resetting trade history...")
+        try:
+            # Create backup if requested
+            if backup and self.trade_history:
+                backup_file = self.history_file.replace('.csv', f'_backup_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv')
+                try:
+                    df_backup = pd.DataFrame(self.trade_history, columns=self.HISTORY_COLUMNS)
+                    df_backup.to_csv(backup_file, index=False, encoding='utf-8')
+                    log.info(f"Created backup of {len(self.trade_history)} trades at: {backup_file}")
+                except Exception as be:
+                    log.warning(f"Could not create backup: {be}")
+            
+            # Clear in-memory history
+            old_count = len(self.trade_history)
+            self.trade_history = []
+            
+            # Save empty history (creates file with just headers)
+            self._save_history()
+            
+            log.info(f"Trade history reset successfully. Cleared {old_count} trades.")
+            return True
+            
+        except Exception as e:
+            log.exception(f"Error resetting trade history: {e}")
+            return False
+
 
     def get_performance_metrics(self, lookback_trades: Optional[int] = None) -> Dict[str, Any]:
         """
@@ -357,7 +393,7 @@ class PerformanceTracker:
                 'win_rate': round(win_rate, 4),
                 'total_profit_currency': round(total_profit_currency, 2),
                 'total_profit_pips': round(total_profit_pips, 2) if pips_col in df.columns else 0.0,
-                'profit_factor': round(profit_factor, 2) if math.isfinite(profit_factor) else 999.99, # Cap infinite PF
+                'profit_factor': round(profit_factor, 2) if math.isfinite(profit_factor) else None, # None implies infinite
                 'average_win_currency': round(average_win_currency, 2),
                 'average_loss_currency': round(average_loss_currency, 2),
                 'expectancy_currency': round(expectancy_currency, 4),

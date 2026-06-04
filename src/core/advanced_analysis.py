@@ -31,16 +31,17 @@ nltk.download('vader_lexicon', quiet=True)  # Download required NLTK data
 import json
 import urllib.parse
 import re
+import re
 import finnhub
-import uuid
+from src.data.external_api import ExternalDataManager
 
 # Attempt to import TensorFlow stuff safely
 try:
     import tensorflow as tf
-    from tensorflow.python.keras.models import Sequential, load_model
-    from tensorflow.python.keras.layers import Dense, LSTM, Dropout, BatchNormalization
-    from tensorflow.python.keras.callbacks import EarlyStopping, ModelCheckpoint
-    from tensorflow.python.keras.optimizers import Adam
+    from tensorflow.keras.models import Sequential, load_model
+    from tensorflow.keras.layers import Dense, LSTM, Dropout, BatchNormalization
+    from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+    from tensorflow.keras.optimizers import Adam
     TF_AVAILABLE = True
 except ImportError:
     TF_AVAILABLE = False
@@ -247,6 +248,17 @@ class AdvancedAnalysis:
         self.mt5 = mt5_instance
         self.cache = {}  # General cache for any data
         
+        # Load configuration
+        self.config = {}
+        try:
+            with open('config/config.json', 'r') as f:
+                self.config = json.load(f)
+        except Exception as e:
+            log.error(f"Error loading config: {e}")
+
+        # Initialize External Data Manager
+        self.external_data = ExternalDataManager(self.config)
+
         # News-specific caching
         self.news_cache = {}  # Cache for news data
         self.news_cache_timestamps = {}  # Timestamps for news cache entries
@@ -503,7 +515,7 @@ class AdvancedAnalysis:
 
     async def fetch_market_news(self, pair: str = None, timeout: int = 20) -> List[Dict]:
         """
-        Fetch market news from Finnhub API, with optional pair filtering.
+        Fetch market news from configured source (defaulting to yfinance or Finnhub), with optional pair filtering.
 
         Args:
             pair: Trading pair to filter news for (e.g., 'EURUSD')
@@ -514,22 +526,50 @@ class AdvancedAnalysis:
         """
         log.info(f"Fetching market news for {pair if pair else 'all markets'}")
         
-        # Get news from Finnhub API
+        source = self.config.get("data_sources", {}).get("news", "finnhub")
+        
+        if source == "yfinance":
+            try:
+                # Use yfinance via ExternalDataManager (synchronous for now, but fast enough)
+                # Run in executor to avoid blocking async loop
+                loop = asyncio.get_event_loop()
+                news_items = await loop.run_in_executor(None, self.external_data.fetch_news_yfinance, pair)
+                
+                # Add sentiment analysis to yfinance news
+                for item in news_items:
+                    sentiment_score = 0.0
+                    sentiment_label = "neutral"
+                    if self.sid and 'title' in item:
+                        sentiment = self.sid.polarity_scores(item['title'])
+                        sentiment_score = sentiment['compound']
+                        if sentiment_score >= 0.25: sentiment_label = "positive"
+                        elif sentiment_score <= -0.25: sentiment_label = "negative"
+                    
+                    item['sentiment'] = {
+                        'combined_score': sentiment_score,
+                        'sentiment_label': sentiment_label
+                    }
+
+                if news_items:
+                    log.info(f"Successfully fetched {len(news_items)} news items from yfinance")
+                    return news_items
+            except Exception as e:
+                log.error(f"Error fetching news from yfinance: {e}")
+                # Fallback to Finnhub
+        
+        # Get news from Finnhub API (Default/Fallback)
         try:
             news_items = await self._fetch_news_from_finnhub(pair)
             if news_items and len(news_items) >= 1:
                 log.info(f"Successfully fetched {len(news_items)} news items from Finnhub API")
                 return news_items
             else:
-                log.warning("No news found from Finnhub API, generating mock news as fallback")
-                mock_news = self._generate_mock_news(pair)
-                return mock_news
+                 log.warning("No news found from Finnhub API")
+                 return []
                 
         except Exception as e:
             log.error(f"Error fetching market news from Finnhub: {str(e)}", exc_info=True)
-            # Generate mock news as a fallback in case of total failure
-            mock_news = self._generate_mock_news(pair)
-            return mock_news
+            return []
 
     async def _fetch_news_from_finnhub(self, pair: str = None) -> List[Dict]:
         """
@@ -541,88 +581,414 @@ class AdvancedAnalysis:
         Returns:
             List of news items with title, URL, published date, source, and sentiment
         """
-        # Use direct API key
-        api_key = 'd08j89pr01qju5m6rfe0d08j89pr01qju5m6rfeg'
+        # Get API key from config
+        api_key = self.config.get('api_keys', {}).get('finnhub', '')
+        if not api_key:
+            log.warning("Finnhub API key not found in config. Using fallback/hardcoded key.")
+            api_key = 'd08j89pr01qju5m6rfe0d08j89pr01qju5m6rfeg'
         
-        try:
-            # Initialize Finnhub client
-            finnhub_client = finnhub.Client(api_key=api_key)
-            
-            # Convert forex/crypto pair to appropriate format if needed
-            category = "forex"
-            search_term = None
-            
-            if pair:
-                # Extract base currency for better search results
-                if len(pair) >= 6:
-                    base_curr = pair[:3]
-                    quote_curr = pair[3:6]
-                    
-                    # Remove any 'm' suffix that might be present for MT5 symbols
-                    base_curr = base_curr.replace('m', '')
-                    quote_curr = quote_curr.replace('m', '')
-                    
-                    if base_curr in ['BTC', 'ETH', 'SOL', 'XRP']:
-                        category = "crypto"
-                        search_term = base_curr
-                    else:
-                        category = "forex"
-                        search_term = f"{base_curr}/{quote_curr}"
-            
-            # Get news from last 3 days (Finnhub format)
-            end_date = datetime.now().strftime("%Y-%m-%d")
-            start_date = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
-            
-            # Fetch general market news
-            news_data = finnhub_client.general_news(category, min_id=0)
-            
-            # Process and format news data
-            news_items = []
-            for item in news_data:
-                # Filter by relevant pair if specified
-                if pair and search_term and search_term.lower() not in item.get('headline', '').lower():
-                    continue
-                    
-                # Convert timestamp to datetime
-                if 'datetime' in item:
-                    pub_time = datetime.fromtimestamp(item['datetime']).strftime("%Y-%m-%d %H:%M:%S")
+        # Attempt to fetch news with retries
+        max_retries = 3
+        retry_delay = 2  # seconds
+        
+        # Convert forex/crypto pair to appropriate format if needed
+        category = "forex"
+        search_term = None
+        
+        if pair:
+            # Extract base currency for better search results
+            if len(pair) >= 6:
+                base_curr = pair[:3]
+                quote_curr = pair[3:6]
+                
+                # Remove any 'm' suffix that might be present for MT5 symbols
+                base_curr = base_curr.replace('m', '')
+                quote_curr = quote_curr.replace('m', '')
+                
+                if base_curr in ['BTC', 'ETH', 'SOL', 'XRP']:
+                    category = "crypto"
+                    search_term = base_curr
                 else:
-                    pub_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    category = "forex"
+                    search_term = f"{base_curr}/{quote_curr}"
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                log.debug(f"Fetching news from Finnhub (attempt {attempt}/{max_retries})")
                 
-                # Add sentiment analysis
-                sentiment_score = 0.0
-                sentiment_label = "neutral"
+                # Initialize Finnhub client without session parameter
+                finnhub_client = finnhub.Client(api_key=api_key)
                 
-                if self.sid and 'headline' in item:
-                    # Use NLTK's VADER for sentiment analysis
-                    sentiment = self.sid.polarity_scores(item['headline'])
-                    sentiment_score = sentiment['compound']
+                # Get news from last 3 days (Finnhub format)
+                end_date = datetime.now().strftime("%Y-%m-%d")
+                start_date = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
+                
+                # Fetch general market news
+                news_data = finnhub_client.general_news(category, min_id=0)
+                
+                # Process and format news data
+                news_items = []
+                for item in news_data:
+                    # Filter by relevant pair if specified
+                    if pair and search_term and search_term.lower() not in item.get('headline', '').lower():
+                        continue
+                        
+                    # Convert timestamp to datetime
+                    if 'datetime' in item:
+                        pub_time = datetime.fromtimestamp(item['datetime']).strftime("%Y-%m-%d %H:%M:%S")
+                    else:
+                        pub_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     
-                    if sentiment_score >= 0.25:
-                        sentiment_label = "positive"
-                    elif sentiment_score <= -0.25:
-                        sentiment_label = "negative"
-                
-                # Create news item in the format expected by the rest of the system
-                news_item = {
-                    'title': item.get('headline', ''),
-                    'url': item.get('url', ''),
-                    'published': pub_time,
-                    'source': item.get('source', 'Finnhub'),
-                    'sentiment': {
-                        'combined_score': sentiment_score,
-                        'sentiment_label': sentiment_label
+                    # Add sentiment analysis
+                    sentiment_score = 0.0
+                    sentiment_label = "neutral"
+                    
+                    if self.sid and 'headline' in item:
+                        # Use NLTK's VADER for sentiment analysis
+                        sentiment = self.sid.polarity_scores(item['headline'])
+                        sentiment_score = sentiment['compound']
+                        
+                        if sentiment_score >= 0.25:
+                            sentiment_label = "positive"
+                        elif sentiment_score <= -0.25:
+                            sentiment_label = "negative"
+                    
+                    # Create news item in the format expected by the rest of the system
+                    news_item = {
+                        'title': item.get('headline', ''),
+                        'url': item.get('url', ''),
+                        'published': pub_time,
+                        'source': item.get('source', 'Finnhub'),
+                        'sentiment': {
+                            'combined_score': sentiment_score,
+                            'sentiment_label': sentiment_label
+                        }
                     }
-                }
+                    
+                    news_items.append(news_item)
                 
-                news_items.append(news_item)
+                log.info(f"Fetched {len(news_items)} news items from Finnhub API")
+                return news_items
+                
+            except finnhub.FinnhubAPIException as e:
+                log.warning(f"Finnhub API error (attempt {attempt}/{max_retries}): {e}")
+                if attempt < max_retries:
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                    continue
+                
+            except Exception as e:
+                log.error(f"Error fetching news from Finnhub API: {str(e)}", exc_info=True)
+                if attempt < max_retries:
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2
+                    continue
+        
+        # If we get here, all retries failed - NO MOCK DATA FOR PRODUCTION
+        log.warning("⚠️ NEWS UNAVAILABLE: All Finnhub API attempts failed. Using NO mock data for safety.")
+        return []  # Return empty - never use mock data for real trading
+
+    async def fetch_external_sentiment(self, pair: str) -> Dict:
+        """
+        Fetches sentiment using local NLTK analysis on news.
+        Falls back to FMP if configured and available.
+        """
+        source = self.config.get("data_sources", {}).get("sentiment", "local")
+        
+        if source == "local":
+            # Use local sentiment analysis on fetched news
+            return await self._analyze_local_sentiment(pair)
+        elif source == "financial_modeling_prep":
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, self.external_data.fetch_sentiment_fmp, pair)
+        return {}
+
+    async def _analyze_local_sentiment(self, pair: str) -> Dict:
+        """
+        Performs local sentiment analysis on news for a given pair.
+        Uses NLTK VADER for sentiment scoring.
+        """
+        try:
+            # Fetch news for the pair
+            news_items = await self.fetch_market_news(pair)
             
-            log.info(f"Fetched {len(news_items)} news items from Finnhub API")
-            return news_items
+            if not news_items:
+                return {
+                    'overall_sentiment': 'neutral',
+                    'sentiment_score': 0.0,
+                    'news_count': 0,
+                    'positive_count': 0,
+                    'negative_count': 0,
+                    'neutral_count': 0
+                }
+            
+            # Aggregate sentiment scores
+            total_score = 0.0
+            positive_count = 0
+            negative_count = 0
+            neutral_count = 0
+            
+            for item in news_items:
+                sentiment = item.get('sentiment', {})
+                score = sentiment.get('combined_score', 0.0)
+                total_score += score
+                
+                if score >= 0.25:
+                    positive_count += 1
+                elif score <= -0.25:
+                    negative_count += 1
+                else:
+                    neutral_count += 1
+            
+            avg_score = total_score / len(news_items) if news_items else 0.0
+            
+            # Determine overall sentiment label
+            if avg_score >= 0.25:
+                overall = 'bullish'
+            elif avg_score >= 0.1:
+                overall = 'slightly_bullish'
+            elif avg_score <= -0.25:
+                overall = 'bearish'
+            elif avg_score <= -0.1:
+                overall = 'slightly_bearish'
+            else:
+                overall = 'neutral'
+            
+            return {
+                'overall_sentiment': overall,
+                'sentiment_score': round(avg_score, 3),
+                'news_count': len(news_items),
+                'positive_count': positive_count,
+                'negative_count': negative_count,
+                'neutral_count': neutral_count
+            }
             
         except Exception as e:
-            log.error(f"Error fetching news from Finnhub API: {str(e)}", exc_info=True)
-            return []
+            log.error(f"Error in local sentiment analysis: {e}")
+            return {'overall_sentiment': 'unknown', 'sentiment_score': 0.0}
+
+    async def generate_market_summary(self, pairs: List[str] = None) -> Dict:
+        """
+        Generates a comprehensive market summary including:
+        - News sentiment for each pair with TRADING RECOMMENDATIONS
+        - Fear & Greed Index
+        - High impact economic events
+        - Overall market outlook
+        
+        Returns data in format expected by GUI.
+        """
+        log.info(f"Generating market summary for pairs: {pairs}...")
+        
+        summary = {
+            'timestamp': datetime.now().isoformat(),
+            'market_mood': 'neutral',
+            'crypto_fear_greed': None,
+            'high_impact_events': [],
+            'pairs': {},
+            'commodities': {},
+            'trading_recommendations': [],  # NEW: Trading recommendations based on news
+            'error': None
+        }
+        
+        try:
+            # Fetch Fear & Greed Index
+            fear_greed = await self.fetch_crypto_fear_greed_index()
+            fear_greed_bias = 0  # -1 to 1, affects trading recommendations
+            if fear_greed is not None:
+                interpretation = 'Extreme Fear' if fear_greed <= 25 else \
+                                'Fear' if fear_greed <= 45 else \
+                                'Neutral' if fear_greed <= 55 else \
+                                'Greed' if fear_greed <= 75 else 'Extreme Greed'
+                summary['crypto_fear_greed'] = {
+                    'value': fear_greed,
+                    'interpretation': interpretation
+                }
+                # Fear = potential buying opportunity, Greed = caution
+                fear_greed_bias = (50 - fear_greed) / 50  # Range: -1 (extreme greed) to 1 (extreme fear)
+            
+            # Get high impact economic events FIRST (affects trading recommendations)
+            high_impact_pairs = set()  # Pairs with upcoming high impact events
+            try:
+                calendar = await self.fetch_economic_calendar()
+                events = calendar.get('events', [])
+                high_impact = [e for e in events if e.get('impact', 0) >= 2]
+                summary['high_impact_events'] = high_impact[:20]
+                
+                # Mark pairs affected by high impact events
+                for event in high_impact:
+                    country = event.get('country', '').upper()
+                    if 'US' in country or 'USD' in country:
+                        for p in (pairs or []):
+                            if 'USD' in p.upper():
+                                high_impact_pairs.add(p)
+                    if 'EUR' in country:
+                        for p in (pairs or []):
+                            if 'EUR' in p.upper():
+                                high_impact_pairs.add(p)
+                    if 'GBP' in country or 'UK' in country:
+                        for p in (pairs or []):
+                            if 'GBP' in p.upper():
+                                high_impact_pairs.add(p)
+            except Exception as cal_e:
+                log.warning(f"Could not fetch calendar: {cal_e}")
+            
+            # Analyze sentiment for each pair
+            total_sentiment = 0.0
+            if pairs:
+                for pair in pairs:
+                    log.info(f"Analyzing sentiment for {pair}...")
+                    try:
+                        # Fetch news and analyze sentiment
+                        news_items = await self.fetch_market_news(pair)
+                        
+                        # Calculate sentiment from news
+                        sentiment_score = 0.0
+                        sentiment_label = 'neutral'
+                        confidence = 0.5
+                        news_impact = 0  # How much news should affect trading
+                        
+                        if news_items:
+                            scores = [item.get('sentiment', {}).get('combined_score', 0) for item in news_items]
+                            sentiment_score = sum(scores) / len(scores) if scores else 0.0
+                            confidence = min(0.5 + len(news_items) * 0.1, 0.99)
+                            news_impact = len(news_items)  # More news = more impact
+                            
+                            if sentiment_score >= 0.25:
+                                sentiment_label = 'positive'
+                            elif sentiment_score <= -0.25:
+                                sentiment_label = 'negative'
+                        
+                        # Generate TRADING RECOMMENDATION for this pair
+                        trade_rec = self._generate_pair_trade_recommendation(
+                            pair, sentiment_score, confidence, news_impact,
+                            fear_greed_bias, pair in high_impact_pairs
+                        )
+                        
+                        summary['pairs'][pair] = {
+                            'sentiment': {
+                                'sentiment': sentiment_label,
+                                'sentiment_score': round(sentiment_score, 2),
+                                'confidence': round(confidence, 2),
+                                'recent_news': news_items[:5],
+                                'news_count': len(news_items),
+                                'news_impact': news_impact
+                            },
+                            'trade_recommendation': trade_rec  # NEW!
+                        }
+                        
+                        # Add significant recommendations to summary
+                        if trade_rec['strength'] >= 0.3 or trade_rec['strength'] <= -0.3:
+                            summary['trading_recommendations'].append({
+                                'pair': pair,
+                                **trade_rec
+                            })
+                        
+                        total_sentiment += sentiment_score
+                        
+                    except Exception as pe:
+                        log.warning(f"Error analyzing {pair}: {pe}")
+                        summary['pairs'][pair] = {'error': str(pe)}
+                
+                # Calculate overall market mood
+                avg_sentiment = total_sentiment / len(pairs) if pairs else 0.0
+                if avg_sentiment >= 0.2:
+                    summary['market_mood'] = 'bullish'
+                elif avg_sentiment >= 0.05:
+                    summary['market_mood'] = 'slightly_bullish'
+                elif avg_sentiment <= -0.2:
+                    summary['market_mood'] = 'bearish'
+                elif avg_sentiment <= -0.05:
+                    summary['market_mood'] = 'slightly_bearish'
+                else:
+                    summary['market_mood'] = 'neutral'
+            
+            # Fetch commodity prices
+            try:
+                loop = asyncio.get_event_loop()
+                wti = await loop.run_in_executor(None, self.external_data.fetch_commodities_alpha, 'WTI')
+                if wti:
+                    summary['commodities']['WTI'] = wti.get('value', 'N/A')
+            except Exception as ce:
+                log.warning(f"Could not fetch commodities: {ce}")
+            
+            log.info(f"Market summary generated. Overall Mood: {summary['market_mood']} (Avg Sentiment: {total_sentiment/len(pairs) if pairs else 0:.3f})")
+            return summary
+            
+        except Exception as e:
+            log.error(f"Error generating market summary: {e}")
+            summary['error'] = str(e)
+            return summary
+
+    def _generate_pair_trade_recommendation(self, pair: str, sentiment_score: float, 
+                                            confidence: float, news_count: int,
+                                            fear_greed_bias: float, has_high_impact_event: bool) -> Dict:
+        """
+        Generates a trading recommendation for a pair based on news sentiment and market conditions.
+        
+        Returns:
+            Dict with 'action', 'strength', 'reason', 'caution'
+        """
+        # Calculate base recommendation strength
+        strength = sentiment_score * confidence
+        
+        # Adjust for Fear & Greed (contrarian approach for crypto)
+        if 'BTC' in pair.upper() or 'ETH' in pair.upper():
+            strength += fear_greed_bias * 0.2  # Slight contrarian adjustment for crypto
+        
+        # Reduce strength if low news coverage
+        if news_count < 2:
+            strength *= 0.5
+            
+        # Determine action and reason
+        action = 'HOLD'
+        reason = 'Insufficient news data'
+        caution = None
+        
+        if strength >= 0.5:
+            action = 'STRONG_BUY'
+            reason = f'Strong positive news sentiment ({sentiment_score:+.2f})'
+        elif strength >= 0.25:
+            action = 'BUY'
+            reason = f'Positive news sentiment ({sentiment_score:+.2f})'
+        elif strength >= 0.1:
+            action = 'WEAK_BUY'
+            reason = f'Slightly positive sentiment ({sentiment_score:+.2f})'
+        elif strength <= -0.5:
+            action = 'STRONG_SELL'
+            reason = f'Strong negative news sentiment ({sentiment_score:+.2f})'
+        elif strength <= -0.25:
+            action = 'SELL'
+            reason = f'Negative news sentiment ({sentiment_score:+.2f})'
+        elif strength <= -0.1:
+            action = 'WEAK_SELL'
+            reason = f'Slightly negative sentiment ({sentiment_score:+.2f})'
+        else:
+            action = 'HOLD'
+            reason = 'Neutral market sentiment'
+        
+        # Add caution for high impact events
+        if has_high_impact_event:
+            caution = '⚠️ High impact event upcoming - trade with caution!'
+            strength *= 0.7  # Reduce confidence
+        
+        return {
+            'action': action,
+            'strength': round(strength, 2),
+            'reason': reason,
+            'caution': caution,
+            'news_based': True
+        }
+
+    async def fetch_external_fundamentals(self, pair: str) -> Dict:
+        """Fetches fundamentals from external source (EODHD)."""
+        source = self.config.get("data_sources", {}).get("fundamentals", "eodhd")
+        if source == "eodhd":
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, self.external_data.fetch_fundamentals_eodhd, pair)
+        elif source == "alpha_vantage":
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, self.external_data.fetch_fundamentals_alpha, pair)
+        return {}
 
     async def _fetch_news_from_source(self, session: aiohttp.ClientSession, source: str, trading_pair: Optional[str] = None) -> List[Dict]:
         """Fetch news from a specific source URL"""
@@ -661,10 +1027,10 @@ class AdvancedAnalysis:
                         if trading_pair and not self._is_relevant_to_pair(title, trading_pair):
                             continue
                             
-                            news_items.append({
-                                'title': title,
-                                'url': url,
-                                'published': published,
+                        news_items.append({
+                            'title': title,
+                            'url': url,
+                            'published': published,
                             'source': 'MyFXBook'
                         })
                     except Exception as e:
@@ -688,15 +1054,15 @@ class AdvancedAnalysis:
                         url_elem = title_elem if title_elem.name == 'a' else title_elem.find('a')
                         url = url_elem['href'] if url_elem and url_elem.has_attr('href') else ''
                         if url and not url.startswith('http'):
-                         url = 'https://www.fxempire.com' + url
+                            url = 'https://www.fxempire.com' + url
                                 
                         # Check relevance
                         if trading_pair and not self._is_relevant_to_pair(title, trading_pair):
                             continue
                             
-                            news_items.append({
-                                'title': title,
-                                'url': url,
+                        news_items.append({
+                            'title': title,
+                            'url': url,
                             'published': datetime.now().strftime("%Y-%m-%d"),
                             'source': 'FX Empire'
                         })
@@ -733,7 +1099,7 @@ class AdvancedAnalysis:
                             # Get date if available
                             date_elem = article.select_one('td.date, span.threadLastPost')
                             published = date_elem.text.strip() if date_elem else ''
-                                
+                            
                             news_items.append({
                                 'title': title,
                                 'url': url,
@@ -765,7 +1131,7 @@ class AdvancedAnalysis:
                         # Find date if available
                         date_elem = article.select_one('time.entry-date, span.post-date')
                         published = date_elem.text.strip() if date_elem else ''
-                        
+                            
                         news_items.append({
                             'title': title,
                             'url': url,
@@ -795,7 +1161,7 @@ class AdvancedAnalysis:
                         # Get date if available
                         date_elem = article.select_one('time, span.date')
                         published = date_elem.text.strip() if date_elem else ''
-                        
+                                
                         news_items.append({
                             'title': title,
                             'url': url,
@@ -901,7 +1267,7 @@ class AdvancedAnalysis:
         except Exception as e:
             log.error(f"Error occurred during news source processing: {str(e)}")
             return []
-
+        
 
     # --- ML Training & Prediction Methods ---
 
@@ -1403,77 +1769,53 @@ class AdvancedAnalysis:
             return default_pred
 
 
-    async def get_high_impact_events(self, days_ahead: int = 3) -> List[Dict]:
+    async def get_high_impact_events(self, days_ahead: int = 2) -> List[Dict]:
         """
-        Fetches and filters high-impact economic events (impact >= 2) for the
-        specified number of upcoming days.
-
+        Get high-impact economic events for the next X days.
+        
         Args:
-            days_ahead: Number of days forward to check for events (including today).
-
+            days_ahead: Number of days ahead to look for events
+            
         Returns:
-            List[Dict]: A list of high-impact event dictionaries, sorted by date/time.
-                        Returns an empty list if fetching fails or no events are found.
+            List of high-impact events
         """
-        log.debug(f"Getting high impact events for the next {days_ahead} days.")
         try:
-             # Fetch calendar data (uses internal caching)
+            # Fetch the economic calendar
             calendar_data = await self.fetch_economic_calendar()
-
-            # Check if calendar data is valid
-            if not isinstance(calendar_data, dict):
-                 log.warning("Could not retrieve valid economic calendar data (expected dict).")
-                 return []
-
+            
+            if not calendar_data or 'events' not in calendar_data:
+                log.warning("No calendar data available or invalid format")
+                return []
+                
+            # Get current date for comparison
+            now = datetime.now()
+            
+            # Process events
             high_impact_events = []
-            # Determine date range in local time
-            today_local = datetime.now().date()
-            end_date_local = today_local + timedelta(days=days_ahead) # Range includes end_date
-
-            log.debug(f"Filtering events from {today_local} to {end_date_local}.")
-
-            # Iterate through the calendar dictionary (keys are local date strings)
-            for date_key, events in calendar_data.items():
-                 try:
-                     # Parse the date key to compare dates
-                     event_date = datetime.strptime(date_key, '%Y-%m-%d').date()
-                 except ValueError:
-                      log.warning(f"Invalid date key format in calendar data: {date_key}. Skipping.")
-                      continue
-
-                 # Check if the event date falls within the desired range
-                 if not (today_local <= event_date <= end_date_local):
-                      continue # Skip dates outside the range
-
-                 # Filter events within the date by impact level
-                 for event in events:
-                     # Ensure impact is an integer, default to 0 if missing/invalid
-                     try:
-                          impact_level = int(event.get('impact', 0))
-                     except (ValueError, TypeError):
-                          impact_level = 0
-
-                     # Check if impact is high (>= 2)
-                     if impact_level >= 2:
-                         # Append relevant details
-                         high_impact_events.append({
-                             'date': date_key, # Local date string 'YYYY-MM-DD'
-                             'time_utc': event.get('time_utc', '--:--'), # Original UTC time string 'HH:MM'
-                             'country': event.get('country', 'Unknown'),
-                             'event': event.get('event', 'Unknown Event'),
-                             'impact': impact_level
-                         })
-
-            # Sort the collected high-impact events by date and then by UTC time
-            high_impact_events.sort(key=lambda x: (x['date'], x['time_utc']))
-
-            log.info(f"Found {len(high_impact_events)} high-impact (>=2) events within the next {days_ahead} days.")
+            
+            for event in calendar_data['events']:
+                try:
+                    # Skip processing if we don't have the necessary data
+                    if 'impact' not in event:
+                        continue
+                        
+                    # Check if this is a high-impact event (impact >= 2)
+                    if event['impact'] < 2:
+                        continue
+                    
+                    # Add the event to our list
+                    high_impact_events.append(event)
+                        
+                except Exception as e:
+                    log.warning(f"Error processing event: {e}")
+                    continue
+                    
+            log.info(f"Found {len(high_impact_events)} high-impact events for the next {days_ahead} days")
             return high_impact_events
-
+            
         except Exception as e:
-             # Catch any errors during the process
-             log.exception(f"Error occurred while getting high impact events: {e}")
-             return [] # Return empty list on failure
+            log.error(f"Error getting high-impact events: {e}")
+            return []
 
 
     # --- Correlation (MT5 Dependent) ---
@@ -2367,6 +2709,187 @@ class AdvancedAnalysis:
               log.error(f"Exception in backtest wrapper thread for {pair} with strategy {strategy}: {e}")
               return {'error': str(e)}
 
+    async def _fetch_news_from_api(self, session: aiohttp.ClientSession, api_url: str, timeout: int) -> List[Dict]:
+        """
+        Fetch news from an API source like Investing.com or similar financial APIs
+        
+        Args:
+            session: aiohttp ClientSession for making requests
+            api_url: URL for the API endpoint
+            timeout: Request timeout in seconds
+            
+        Returns:
+            List of parsed news items with title, url, published date and source
+        """
+        log.info(f"Fetching news from API: {api_url}")
+        
+        try:
+            # Add random headers to avoid being blocked
+            headers = get_random_headers()
+            
+            # Some APIs require API keys in headers or as query parameters
+            # Modify this as needed for the specific API
+            api_key = os.environ.get('FINANCIAL_NEWS_API_KEY', '')
+            if api_key:
+                headers['X-API-Key'] = api_key
+                
+            # Make the API request
+            async with session.get(api_url, headers=headers, timeout=timeout) as response:
+                if response.status != 200:
+                    log.error(f"API request failed with status {response.status}: {api_url}")
+                    return []
+                
+                # Parse JSON response
+                data = await response.json()
+                
+                # Initialize news items list
+                news_items = []
+                
+                # Handle different API response structures
+                # This is just an example, adjust based on the actual API response structure
+                if "investing.com" in api_url:
+                    # Process Investing.com API response
+                    articles = data.get('data', [])
+                    for article in articles[:15]:  # Limit to top 15
+                        news_items.append({
+                            'title': article.get('title', 'No Title'),
+                            'url': article.get('url', ''),
+                            'published': article.get('published_at', ''),
+                            'source': 'Investing.com API'
+                        })
+                elif "financialmodelingprep.com" in api_url:
+                    # Process Financial Modeling Prep API response
+                    # Handle both standard and newer stable API formats
+                    if isinstance(data, list):
+                        # Newer FMP API returns a list directly
+                        articles = data
+                    else:
+                        # Older FMP API might have data in 'content' or similar field
+                        articles = data.get('content', data.get('articles', []))
+                    
+                    for article in articles[:15]:
+                        # Extract fields - FMP has different formats depending on endpoint
+                        title = article.get('title', article.get('headline', 'No Title'))
+                        url = article.get('url', article.get('link', ''))
+                        published = article.get('publishedDate', article.get('published_at', 
+                                      article.get('date', '')))
+                        
+                        # Handle source field variations
+                        source = 'FMP News API'
+                        if 'site' in article:
+                            source = f"FMP: {article.get('site')}"
+                        elif 'source' in article:
+                            source = f"FMP: {article.get('source')}"
+                            
+                        # Add symbol-related information if available
+                        symbol = article.get('symbol', '')
+                        if symbol and title:
+                            if symbol not in title:
+                                title = f"[{symbol}] {title}"
+                        
+                        news_items.append({
+                            'title': title,
+                            'url': url,
+                            'published': published,
+                            'source': source,
+                            'symbol': symbol if symbol else None
+                        })
+                elif "marketaux.com" in api_url:
+                    # Process MarketAux API response
+                    articles = data.get('data', [])
+                    for article in articles[:15]:
+                        news_items.append({
+                            'title': article.get('title', 'No Title'),
+                            'url': article.get('url', ''),
+                            'published': article.get('published_at', ''),
+                            'source': 'MarketAux API'
+                        })
+                elif "alphavantage.co" in api_url:
+                    # Process Alpha Vantage API response
+                    feed = data.get('feed', [])
+                    
+                    for article in feed[:15]:
+                        # Extract fields
+                        title = article.get('title', 'No Title')
+                        url = article.get('url', '')
+                        published = article.get('time_published', '')
+                        source = article.get('source', 'Alpha Vantage')
+                        
+                        # Extract sentiment data if available
+                        sentiment_data = {}
+                        if 'overall_sentiment_score' in article:
+                            score = article.get('overall_sentiment_score', 0)
+                            sentiment_label = 'positive' if score > 0.25 else 'negative' if score < -0.25 else 'neutral'
+                            sentiment_data = {
+                                'vader_compound': score,
+                                'textblob_polarity': score,
+                                'textblob_subjectivity': 0.5,
+                                'combined_score': score,
+                                'sentiment_label': sentiment_label
+                            }
+                            
+                        # Get relevant tickers if available
+                        ticker_symbols = []
+                        if 'ticker_sentiment' in article:
+                            ticker_sentiments = article.get('ticker_sentiment', [])
+                            ticker_symbols = [t.get('ticker', '') for t in ticker_sentiments]
+                            
+                        # Add forex-specific tag if present
+                        forex_mentioned = any(t.startswith('FOREX:') for t in ticker_symbols)
+                        crypto_mentioned = any(t.startswith('CRYPTO:') for t in ticker_symbols)
+                        
+                        if forex_mentioned:
+                            if 'FOREX' not in title and 'forex' not in title.lower():
+                                title = f"[FOREX] {title}"
+                        elif crypto_mentioned:
+                            if 'CRYPTO' not in title and 'crypto' not in title.lower():
+                                title = f"[CRYPTO] {title}"
+                        
+                        news_item = {
+                            'title': title,
+                            'url': url,
+                            'published': published,
+                            'source': source,
+                            'tickers': ticker_symbols if ticker_symbols else None
+                        }
+                        
+                        # Include sentiment data if available
+                        if sentiment_data:
+                            news_item['sentiment'] = sentiment_data
+                            
+                        news_items.append(news_item)
+                else:
+                    # Generic API handling
+                    # Attempt to handle unknown API format by looking for common fields
+                    articles = data.get('articles', data.get('data', data.get('items', [])))
+                    for article in articles[:15]:
+                        title = article.get('title', article.get('headline', 'No Title'))
+                        url = article.get('url', article.get('link', ''))
+                        published = article.get('published_at', 
+                                      article.get('publishedDate', 
+                                      article.get('date', '')))
+                        source = article.get('source', 'Financial News API')
+                        
+                        news_items.append({
+                            'title': title,
+                            'url': url,
+                            'published': published,
+                            'source': source
+                        })
+                
+                log.debug(f"Fetched {len(news_items)} news items from API: {api_url}")
+                return news_items
+                
+        except aiohttp.ClientError as e:
+            log.error(f"API request error: {str(e)}")
+            return []
+        except json.JSONDecodeError as e:
+            log.error(f"Failed to parse API response as JSON: {str(e)}")
+            return []
+        except Exception as e:
+            log.error(f"Unexpected error fetching news from API: {str(e)}", exc_info=True)
+            return []
+
     def e_generate_mock_news(self, pair: Optional[str] = None) -> List[Dict]:
         """Generate reliable mock news items for testing when all sources fail"""
         log.warning("Generating mock news items for testing purposes")
@@ -2537,81 +3060,54 @@ class AdvancedAnalysis:
 
     def _is_relevant_to_pair(self, text: str, pair: str) -> bool:
         """
-        Determine if a text is relevant to a specific trading pair.
+        Check if the text is relevant to the specified trading pair
         
         Args:
-            text: The text to analyze
-            pair: Trading pair (e.g., 'BTCUSD')
+            text: Text to check (news title or content)
+            pair: Trading pair in format 'EURUSD' or similar
             
         Returns:
-            Boolean indicating relevance
+            True if text is relevant to the pair, False otherwise
         """
-        if not text or not pair:
+        # Extract currencies from pair
+        if len(pair) >= 6:
+            base_currency = pair[:3]
+            quote_currency = pair[3:6]
+        else:
+            # Handle non-standard pairs
             return False
             
-        # Extract symbols from the pair
-        base, quote = self._extract_base_quote(pair)
-        
-        # Normalize text
-        text = text.lower()
-        
-        # Check for the trading pair or its components in the text
-        if pair.lower() in text:
-            return True
-            
-        # Check for base currency
-        if base.lower() in text:
-            return True
-            
-        # Check for common names of cryptocurrencies
-        crypto_names = {
-            'btc': ['bitcoin', 'btc'],
-            'eth': ['ethereum', 'eth'],
-            'xrp': ['ripple', 'xrp'],
-            'ltc': ['litecoin', 'ltc'],
-            'bnb': ['binance', 'bnb'],
-            'ada': ['cardano', 'ada'],
-            'sol': ['solana', 'sol'],
-            'doge': ['dogecoin', 'doge']
+        # Common names for currencies
+        currency_names = {
+            'EUR': ['euro', 'euros', 'eur', '€', 'eurozone', 'ecb', 'european central bank'],
+            'USD': ['dollar', 'dollars', 'usd', '$', 'us dollar', 'federal reserve', 'fed', 'fomc'],
+            'GBP': ['pound', 'pounds', 'sterling', 'gbp', '£', 'boe', 'bank of england'],
+            'JPY': ['yen', 'jpy', '¥', 'boj', 'bank of japan'],
+            'CHF': ['franc', 'francs', 'chf', 'swiss', 'snb', 'swiss national bank'],
+            'CAD': ['canadian dollar', 'cad', 'c$', 'loonie', 'bank of canada', 'boc'],
+            'AUD': ['australian dollar', 'aud', 'a$', 'aussie', 'rba', 'reserve bank of australia'],
+            'NZD': ['new zealand dollar', 'nzd', 'kiwi', 'rbnz', 'reserve bank of new zealand']
         }
         
-        # Check if base currency has common names and if they appear in text
-        base_lower = base.lower()
-        if base_lower in crypto_names:
-            for name in crypto_names[base_lower]:
-                if name in text:
-                    return True
+        # Normalize text for comparison
+        text_lower = text.lower()
         
-        return False
-        
-    def _extract_base_quote(self, pair: str) -> Tuple[str, str]:
-        """
-        Extract base and quote currencies from a trading pair.
-        
-        Args:
-            pair: Trading pair (e.g., 'BTCUSD')
+        # Check for exact pair match
+        pair_slash = f"{base_currency}/{quote_currency}"
+        if pair.lower() in text_lower or pair_slash.lower() in text_lower:
+            return True
             
-        Returns:
-            Tuple of (base_currency, quote_currency)
-        """
-        # Common quote currencies
-        quote_currencies = ['usd', 'usdt', 'usdc', 'eur', 'gbp', 'jpy', 'aud', 'cad']
+        # Check for keywords related to both currencies
+        base_keywords = currency_names.get(base_currency, [base_currency.lower()])
+        quote_keywords = currency_names.get(quote_currency, [quote_currency.lower()])
         
-        pair = pair.lower()
+        # News is relevant if it mentions both currencies or their related terms
+        base_mentioned = any(keyword in text_lower for keyword in base_keywords)
+        quote_mentioned = any(keyword in text_lower for keyword in quote_keywords)
         
-        # Try standard format with common quote currencies
-        for quote in quote_currencies:
-            if pair.endswith(quote):
-                base = pair[:-len(quote)]
-                return base, quote
-        
-        # If no match, use simple split at position 3 or 4
-        if len(pair) >= 6:
-            return pair[:3], pair[3:]
-        else:
-            # Default split in the middle for unknown pairs
-            mid = len(pair) // 2
-            return pair[:mid], pair[mid:]
+        # Only return true if both currencies are mentioned (higher relevance)
+        # For less strict filtering, could return true if either is mentioned
+        return base_mentioned and quote_mentioned
 
     class RateLimiter:
         def __init__(self, calls_per_second=1):
@@ -2650,19 +3146,19 @@ class AdvancedAnalysis:
 
     def _default_sentiment(self) -> Dict:
         """
-        Return a default neutral sentiment when no news is available.
+        Returns a default sentiment dictionary with neutral values.
+        Used as a fallback when sentiment analysis fails or is not available.
         
         Returns:
-            Dictionary with neutral sentiment values
+            Dict: Default sentiment information with neutral values.
         """
         return {
-            'average_sentiment': 0.0,
+            'sentiment_score': 0.0,
             'sentiment_label': 'neutral',
-            'distribution': {'positive': 0.0, 'neutral': 1.0, 'negative': 0.0},
-            'total_articles': 0,
-            'pair_relevant_count': 0,
-            'sources': [],
-            'freshness': {'newest': None, 'oldest': None}
+            'confidence': 0.5,
+            'news_count': 0,
+            'keywords': [],
+            'error': None
         }
         
     async def analyze_pair_sentiment(self, pair: str) -> Dict:
@@ -2826,259 +3322,3 @@ class AdvancedAnalysis:
         except Exception as e:
             log.error(f"Error occurred during false signal (anomaly) detection: {e}", exc_info=False)
             return False  # Default to not blocking the signal on error
-
-    def _generate_mock_news(self, pair: Optional[str] = None) -> List[Dict]:
-        """
-        Generate mock financial news when real sources are unavailable.
-        
-        Args:
-            pair: Optional trading pair to create relevant news for
-            
-        Returns:
-            List of mock news items with appropriate structure
-        """
-        log.warning(f"Generating mock news for {pair if pair else 'general market'}")
-        
-        # Get current timestamp for news
-        now = datetime.now()
-        
-        # Create relevant title based on pair
-        titles = [
-            "Market volatility continues as traders await key economic data",
-            "Analysts predict sideways trading for the week ahead",
-            "Technical indicators suggest potential breakout coming soon",
-            "Trading volumes remain low amid cautious market sentiment",
-            "Market participants eye central bank comments for direction"
-        ]
-        
-        # If specific pair, add more relevant titles
-        if pair:
-            base_curr = pair[:3] if len(pair) >= 3 else ""
-            quote_curr = pair[3:6] if len(pair) >= 6 else ""
-            
-            if base_curr in ['BTC', 'ETH', 'XRP', 'SOL']:
-                crypto_titles = [
-                    f"{base_curr} stabilizes after weekend volatility",
-                    f"Institutional interest in {base_curr} continues to grow",
-                    f"Technical analysis: {base_curr} approaching key resistance level",
-                    f"On-chain metrics show increasing {base_curr} adoption",
-                    f"{base_curr} trading volume spikes amid market uncertainty"
-                ]
-                titles.extend(crypto_titles)
-            else:
-                forex_titles = [
-                    f"{base_curr}/{quote_curr} trading within established range",
-                    f"Economic data could impact {base_curr} pairs this week",
-                    f"{base_curr} strength continues against major currencies",
-                    f"Traders watching {base_curr}/{quote_curr} technical patterns",
-                    f"Market awaits volatility in {base_curr} crosses"
-                ]
-                titles.extend(forex_titles)
-        
-        # Generate random sentiment values
-        sentiments = [
-            {"combined_score": 0.32, "sentiment_label": "positive"},
-            {"combined_score": -0.27, "sentiment_label": "negative"},
-            {"combined_score": 0.05, "sentiment_label": "neutral"},
-            {"combined_score": 0.15, "sentiment_label": "neutral"},
-            {"combined_score": -0.12, "sentiment_label": "neutral"}
-        ]
-        
-        # Generate 5-8 mock news items
-        num_items = random.randint(5, 8)
-        mock_news = []
-        
-        for i in range(num_items):
-            # Randomize publication time within last 24 hours
-            hours_ago = random.randint(0, 24)
-            pub_time = (now - timedelta(hours=hours_ago)).strftime("%Y-%m-%d %H:%M:%S")
-            
-            # Create news item
-            news_item = {
-                "title": random.choice(titles),
-                "url": f"https://mock-financial-news.com/article/{uuid.uuid4().hex[:8]}",
-                "published": pub_time,
-                "source": random.choice(["MarketNews", "FinancialTimes", "TradingNews", "InvestorDaily", "Finnhub"]),
-                "sentiment": random.choice(sentiments)
-            }
-            
-            mock_news.append(news_item)
-        
-        log.info(f"Generated {len(mock_news)} mock news items")
-        return mock_news
-
-    def analyze_news_sentiment(self, news_items: List[Dict], pair: str = None) -> Dict:
-        """
-        Analyze sentiment of news items, optionally filtered by trading pair relevance.
-        
-        Args:
-            news_items: List of news items to analyze
-            pair: Optional trading pair to filter relevant news
-            
-        Returns:
-            Dict containing sentiment analysis results
-        """
-        log.info(f"Analyzing sentiment for {len(news_items)} news items" + 
-                 (f" related to {pair}" if pair else ""))
-                 
-        # Return default if no news items
-        if not news_items:
-            log.warning("No news items provided for sentiment analysis")
-            return self._default_sentiment()
-            
-        # Initialize tracking variables
-        sentiment_scores = []
-        positive_count = 0
-        negative_count = 0
-        neutral_count = 0
-        sources = set()
-        timestamps = []
-        pair_relevant_count = 0
-        
-        # Process each news item
-        for item in news_items:
-            # Extract sentiment score - either from pre-calculated data or calculate basic sentiment
-            if 'sentiment' in item and 'combined_score' in item['sentiment']:
-                sentiment_score = item['sentiment']['combined_score']
-                sentiment_label = item['sentiment']['sentiment_label']
-            elif 'title' in item:
-                sentiment_score, sentiment_label = self._extract_basic_sentiment(item['title'])
-            else:
-                continue  # Skip items without sentiment or title
-                
-            # Track sentiment distribution
-            if sentiment_label == 'positive':
-                positive_count += 1
-            elif sentiment_label == 'negative':
-                negative_count += 1
-            else:
-                neutral_count += 1
-                
-            # Check if news is relevant to the pair
-            is_relevant = True
-            if pair:
-                is_relevant = (
-                    self._is_relevant_to_pair(item.get('title', ''), pair) or
-                    self._is_relevant_to_pair(item.get('description', ''), pair)
-                )
-                if is_relevant:
-                    pair_relevant_count += 1
-            
-            # Add sentiment score if relevant (or if we're not filtering by pair)
-            if not pair or is_relevant:
-                sentiment_scores.append(sentiment_score)
-                
-            # Track news sources
-            if 'source' in item:
-                sources.add(item['source'])
-                
-            # Track timestamps for freshness analysis
-            if 'published' in item:
-                try:
-                    # Handle different timestamp formats
-                    if isinstance(item['published'], (int, float)):
-                        timestamps.append(datetime.fromtimestamp(item['published']))
-                    else:
-                        timestamps.append(datetime.fromisoformat(item['published'].replace('Z', '+00:00')))
-                except (ValueError, TypeError):
-                    # If we can't parse the timestamp, ignore it
-                    pass
-        
-        # Calculate average sentiment
-        if sentiment_scores:
-            # Weight more recent news higher if we have timestamps
-            if timestamps:
-                # Sort by timestamp, newest first
-                pairs = sorted(zip(timestamps, sentiment_scores), key=lambda x: x[0], reverse=True)
-                timestamps, sentiment_scores = zip(*pairs)
-                
-                # Create linearly decreasing weights, newest news gets highest weight
-                weights = np.linspace(1.0, 0.5, len(sentiment_scores))
-                avg_sentiment = float(np.average(sentiment_scores, weights=weights))
-            else:
-                # Simple average if no timestamps
-                avg_sentiment = float(np.mean(sentiment_scores))
-        else:
-            avg_sentiment = 0.0
-            
-        # Determine overall sentiment label
-        sentiment_label = 'neutral'
-        if avg_sentiment >= 0.25:
-            sentiment_label = 'positive'
-        elif avg_sentiment <= -0.25:
-            sentiment_label = 'negative'
-            
-        # Calculate distribution percentages
-        total_count = positive_count + negative_count + neutral_count
-        if total_count > 0:
-            distribution = {
-                'positive': positive_count / total_count,
-                'neutral': neutral_count / total_count,
-                'negative': negative_count / total_count
-            }
-        else:
-            distribution = {'positive': 0.0, 'neutral': 1.0, 'negative': 0.0}
-            
-        # Prepare result
-        result = {
-            'average_sentiment': round(avg_sentiment, 3),
-            'sentiment_label': sentiment_label,
-            'distribution': {k: round(v, 2) for k, v in distribution.items()},
-            'total_articles': total_count,
-            'pair_relevant_count': pair_relevant_count,
-            'sources': list(sources),
-            'freshness': {
-                'newest': max(timestamps).isoformat() if timestamps else None,
-                'oldest': min(timestamps).isoformat() if timestamps else None
-            }
-        }
-        
-        log.info(f"Sentiment analysis complete: {sentiment_label} ({avg_sentiment:.3f}), " +
-                f"based on {total_count} news items" +
-                (f", {pair_relevant_count} relevant to {pair}" if pair else ""))
-                
-        return result
-    
-    def _extract_basic_sentiment(self, text: str) -> Tuple[float, str]:
-        """
-        Extract basic sentiment from text using keyword matching.
-        
-        Args:
-            text: The text to analyze
-            
-        Returns:
-            Tuple of (sentiment_score, sentiment_label)
-        """
-        # Lists of keywords for sentiment analysis
-        positive_words = [
-            'bullish', 'rally', 'gain', 'grows', 'rise', 'rising', 'soars', 'up', 'upside',
-            'support', 'strong', 'strength', 'positive', 'profit', 'opportunity', 'rebound',
-            'recovery', 'breakthrough', 'outperform', 'beat', 'exceeded', 'momentum', 'confident'
-        ]
-        
-        negative_words = [
-            'bearish', 'drop', 'falls', 'falling', 'plunge', 'plummet', 'down', 'downside',
-            'resistance', 'weak', 'weakness', 'negative', 'loss', 'risk', 'correction',
-            'decline', 'pressure', 'underperform', 'missed', 'disappointing', 'concern', 'cautious'
-        ]
-        
-        # Normalize text
-        text = text.lower()
-        
-        # Count occurrences of sentiment keywords
-        positive_count = sum(1 for word in positive_words if word in text)
-        negative_count = sum(1 for word in negative_words if word in text)
-        
-        # Calculate sentiment score
-        sentiment_score = (positive_count - negative_count) / (positive_count + negative_count + 1)
-        
-        # Determine sentiment label
-        if sentiment_score > 0.2:
-            sentiment_label = 'positive'
-        elif sentiment_score < -0.2:
-            sentiment_label = 'negative'
-        else:
-            sentiment_label = 'neutral'
-        
-        return sentiment_score, sentiment_label
-

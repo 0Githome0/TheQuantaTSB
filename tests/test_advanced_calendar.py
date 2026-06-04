@@ -1,8 +1,10 @@
 import asyncio
 import logging
 import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import time
-from advanced_analysis import AdvancedAnalysis
+from src.core.advanced_analysis import AdvancedAnalysis
 
 # Configure logging to send output to both file and console
 logging.basicConfig(
@@ -109,4 +111,4 @@ async def test_advanced_calendar():
         print("=" * 80)
 
 if __name__ == "__main__":
-    asyncio.run(test_advanced_calendar()) 
+    asyncio.run(test_advanced_calendar())

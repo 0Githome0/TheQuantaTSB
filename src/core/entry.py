@@ -17,7 +17,15 @@ import warnings
 import json
 
 # Import the SignalGenerator from Signal.py
-from Signal import SignalGenerator, TimeFrames
+from src.core.signal import SignalGenerator, TimeFrames
+
+# Import Order Flow Analyzer for entry validation
+try:
+    from src.core.orderflow_analyzer import OrderFlowAnalyzer, FlowSignal
+    HAS_ORDERFLOW = True
+except ImportError:
+    HAS_ORDERFLOW = False
+    OrderFlowAnalyzer = None
 
 # Configure logging
 log = logging.getLogger('EntryStrategies')
@@ -97,10 +105,62 @@ class AdvancedEntryStrategies:
         self.BREAKOUT_SL_MULTIPLIER = 1.2       # Stop loss multiplier for breakouts
         self.PULLBACK_SL_MULTIPLIER = 0.8       # Stop loss multiplier for pullbacks
         
+        # Order Flow Analyzer for entry validation
+        if HAS_ORDERFLOW:
+            self.orderflow = OrderFlowAnalyzer(
+                lookback=50,
+                value_area_pct=0.70,
+                imbalance_threshold=2.5,
+                smart_money_vol_mult=3.0,
+                min_confirmation_score=4
+            )
+            log.info("Order Flow Analyzer integrated for entry validation.")
+        else:
+            self.orderflow = None
+            log.warning("Order Flow Analyzer not available.")
+        
+        # Session Trading Windows (UTC hours)
+        self.TRADING_SESSIONS = {
+            'ASIAN': (0, 8, ['USDJPY', 'AUDUSD', 'NZDUSD']),
+            'LONDON': (8, 16, ['EURUSD', 'GBPUSD', 'EURGBP', 'USDCHF']),
+            'NEW_YORK': (13, 21, ['EURUSD', 'GBPUSD', 'USDCAD', 'XAUUSD']),
+            'OVERLAP': (13, 16, None)  # All pairs - best time
+        }
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # ICT KILL ZONES (Optimal Entry Windows - UTC)
+        # ═══════════════════════════════════════════════════════════════════════
+        self.KILL_ZONES = {
+            'LONDON_OPEN': (7, 10),      # 07:00-10:00 UTC - High volatility
+            'NY_OPEN': (12, 15),         # 12:00-15:00 UTC - Maximum liquidity
+            'LONDON_CLOSE': (15, 17),    # 15:00-17:00 UTC - Institutional moves
+            'ASIAN_OPEN': (0, 3),        # 00:00-03:00 UTC - JPY pairs
+        }
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # MULTIPLE TAKE PROFITS & TRAIL STOP
+        # ═══════════════════════════════════════════════════════════════════════
+        self.MULTIPLE_TPS = {
+            'TP1': {'ratio': 1.0, 'close_percent': 50},   # 1:1 R:R, close 50%
+            'TP2': {'ratio': 2.0, 'close_percent': 30},   # 2:1 R:R, close 30%
+            'TP3': {'ratio': 3.0, 'close_percent': 20},   # 3:1 R:R, close remaining 20%
+        }
+        self.TRAIL_STOP_AFTER_TP1 = True       # Move SL to breakeven after TP1
+        self.TRAIL_STOP_ATR_MULTIPLIER = 1.5   # Trail by 1.5x ATR
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # LIQUIDITY SWEEP DETECTION
+        # ═══════════════════════════════════════════════════════════════════════
+        self.LIQUIDITY_SWEEP_LOOKBACK = 20     # Bars to look for liquidity
+        self.LIQUIDITY_SWEEP_BUFFER = 0.0002   # Price buffer for sweep detection
+        
+        # High-impact news avoidance (minutes before/after)
+        self.NEWS_BUFFER_MINUTES = 30
+        
         log.info("Advanced Entry Strategies initialized successfully.")
     
     @classmethod
-    def from_config(cls, config_path: str = 'entry_config.json'):
+    def from_config(cls, config_path: str = 'config/entry_config.json'):
         """Create instance from configuration file."""
         try:
             with open(config_path, 'r') as f:
@@ -168,6 +228,19 @@ class AdvancedEntryStrategies:
                 pair, primary_df, primary_timeframe
             )
             
+            # ══════════════════════════════════════════════════════════════════
+            # ORDER FLOW VALIDATION
+            # ══════════════════════════════════════════════════════════════════
+            orderflow_analysis = self._validate_with_orderflow(
+                pair, primary_df, mtf_analysis, breakout_analysis, pullback_analysis
+            )
+            
+            # ══════════════════════════════════════════════════════════════════
+            # SESSION & MARKET STRUCTURE ANALYSIS
+            # ══════════════════════════════════════════════════════════════════
+            session_analysis = self._analyze_session_suitability(pair)
+            market_structure = self._analyze_market_structure(primary_df)
+            
             # Combine analyses and determine best entry
             combined_analysis = self._combine_entry_analyses(
                 base_signal, mtf_analysis, breakout_analysis, pullback_analysis
@@ -193,6 +266,12 @@ class AdvancedEntryStrategies:
                     best_strategy_action = pullback_analysis.get('signal_type').name if pullback_analysis.get('signal_type') else None
                     best_strategy_details = pullback_analysis.get('details')
 
+            # Apply Order Flow confidence adjustment
+            if orderflow_analysis.get('validated') and orderflow_analysis.get('action') == 'WAIT':
+                entry_recommendation['action'] = 'WAIT'
+                entry_recommendation['reason'] = 'Order Flow OPPOSES signal'
+                entry_recommendation['orderflow_override'] = True
+
             result = {
                 'pair': pair,
                 'timeframe': primary_timeframe.name,
@@ -201,10 +280,13 @@ class AdvancedEntryStrategies:
                 'multi_timeframe': mtf_analysis,
                 'breakout': breakout_analysis,
                 'pullback': pullback_analysis,
+                'orderflow': orderflow_analysis,  # NEW: Order Flow validation
+                'session': session_analysis,  # NEW: Session suitability
+                'market_structure': market_structure,  # NEW: BOS/CHoCH
                 'combined_analysis': combined_analysis,
                 'entry_recommendation': entry_recommendation,
-                'action': best_strategy_action,  # e.g., 'Breakout Buy', 'Pullback Sell', etc.
-                'action_details': best_strategy_details  # e.g., confidence factors, technical context
+                'action': best_strategy_action,
+                'action_details': best_strategy_details
             }
             
             log.info(f"Entry analysis completed for {pair}. Best strategy: {entry_recommendation.get('best_strategy', 'None')}")
@@ -1259,6 +1341,570 @@ class AdvancedEntryStrategies:
                 'volatility': 'UNKNOWN',
                 'market_phase': 'UNKNOWN'
             }
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ORDER FLOW VALIDATION
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    def _validate_with_orderflow(self, pair: str, df: pd.DataFrame,
+                                  mtf_analysis: Dict, breakout_analysis: Dict,
+                                  pullback_analysis: Dict) -> Dict:
+        """
+        Validate entry signals using Order Flow analysis.
+        
+        If Order Flow OPPOSES the signal, reduce confidence or invalidate.
+        If Order Flow CONFIRMS, boost confidence.
+        """
+        if not self.orderflow or df is None or len(df) < 50:
+            return {
+                'validated': False,
+                'status': 'NOT_AVAILABLE',
+                'reason': 'Order Flow analyzer not available'
+            }
+        
+        try:
+            # Determine the dominant signal direction
+            buy_confidence = 0
+            sell_confidence = 0
+            
+            for analysis in [mtf_analysis, breakout_analysis, pullback_analysis]:
+                signal_type = analysis.get('signal_type')
+                conf = analysis.get('confidence', 0)
+                
+                if signal_type and 'BUY' in signal_type.value:
+                    buy_confidence += conf
+                elif signal_type and 'SELL' in signal_type.value:
+                    sell_confidence += conf
+            
+            # Determine direction to validate
+            if buy_confidence > sell_confidence:
+                direction = 'BUY'
+                strategy_confidence = buy_confidence
+            elif sell_confidence > buy_confidence:
+                direction = 'SELL'
+                strategy_confidence = sell_confidence
+            else:
+                return {
+                    'validated': False,
+                    'status': 'NEUTRAL',
+                    'reason': 'No clear directional bias'
+                }
+            
+            # Get Order Flow confirmation
+            of_result = self.orderflow.get_confirmation(direction, df)
+            of_status = of_result.get('status', 'NEUTRAL')
+            of_confidence = of_result.get('confidence', 0.5)
+            of_score = of_result.get('score', 0)
+            
+            # Build result
+            result = {
+                'validated': True,
+                'direction': direction,
+                'status': of_status,
+                'orderflow_confidence': of_confidence,
+                'orderflow_score': of_score,
+                'reasons': of_result.get('reasons', []),
+                'warnings': of_result.get('warnings', []),
+                'metrics': of_result.get('metrics', {})
+            }
+            
+            # Adjust strategy confidence based on Order Flow
+            if of_status in ['STRONG_CONFIRM', 'CONFIRM']:
+                result['confidence_adjustment'] = min(of_confidence * 0.2, 0.15)  # Boost up to 15%
+                result['action'] = 'PROCEED'
+                log.info(f"Order Flow CONFIRMS {direction} for {pair} (score: {of_score})")
+            elif of_status in ['STRONG_OPPOSE', 'OPPOSE']:
+                result['confidence_adjustment'] = -min(of_confidence * 0.3, 0.25)  # Reduce up to 25%
+                result['action'] = 'WAIT'
+                log.warning(f"Order Flow OPPOSES {direction} for {pair} (score: {of_score})")
+            else:
+                result['confidence_adjustment'] = 0
+                result['action'] = 'CAUTION'
+                log.info(f"Order Flow NEUTRAL for {pair}")
+            
+            return result
+            
+        except Exception as e:
+            log.error(f"Error in Order Flow validation: {e}")
+            return {
+                'validated': False,
+                'status': 'ERROR',
+                'reason': str(e)
+            }
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SESSION ANALYSIS
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    def _analyze_session_suitability(self, pair: str) -> Dict:
+        """
+        Analyze if current session is suitable for trading this pair.
+        
+        Returns session info and suitability score.
+        """
+        try:
+            from datetime import datetime, timezone
+            
+            current_time = datetime.now(timezone.utc)
+            hour = current_time.hour
+            
+            # Normalize pair name (remove broker suffix)
+            base_pair = pair.replace('m', '').replace('_', '').upper()[:6]
+            
+            current_session = None
+            is_optimal = False
+            suitability_score = 0.5  # Default neutral
+            
+            for session_name, (start, end, pairs) in self.TRADING_SESSIONS.items():
+                if start <= hour < end:
+                    current_session = session_name
+                    
+                    # Check if pair is suitable for this session
+                    if pairs is None:  # Overlap - all pairs good
+                        is_optimal = True
+                        suitability_score = 1.0
+                    elif any(p in base_pair for p in pairs):
+                        is_optimal = True
+                        suitability_score = 0.9
+                    else:
+                        suitability_score = 0.6
+                    break
+            
+            if not current_session:
+                current_session = 'OFF_HOURS'
+                suitability_score = 0.3
+            
+            # Check for overlap (best trading time)
+            if 13 <= hour < 16:
+                current_session = 'LONDON_NY_OVERLAP'
+                is_optimal = True
+                suitability_score = 1.0
+            
+            return {
+                'session': current_session,
+                'is_optimal': is_optimal,
+                'suitability_score': suitability_score,
+                'hour_utc': hour,
+                'recommendation': 'TRADE' if suitability_score >= 0.7 else 'CAUTION' if suitability_score >= 0.5 else 'AVOID'
+            }
+            
+        except Exception as e:
+            log.error(f"Error in session analysis: {e}")
+            return {
+                'session': 'UNKNOWN',
+                'is_optimal': False,
+                'suitability_score': 0.5,
+                'recommendation': 'CAUTION'
+            }
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # MARKET STRUCTURE ANALYSIS (BOS/CHoCH)
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    def _analyze_market_structure(self, df: pd.DataFrame) -> Dict:
+        """
+        Analyze market structure for Break of Structure (BOS) and 
+        Change of Character (CHoCH).
+        
+        - BOS: Price breaks above swing high (bullish) or below swing low (bearish)
+        - CHoCH: First BOS in opposite direction of prevailing trend
+        """
+        if df is None or len(df) < 50:
+            return {
+                'structure': 'UNKNOWN',
+                'bos_detected': False,
+                'choch_detected': False
+            }
+        
+        try:
+            # Find swing points
+            window = 5
+            swing_highs = []
+            swing_lows = []
+            
+            for i in range(window, len(df) - window):
+                # Swing high
+                if df['high'].iloc[i] == df['high'].iloc[i-window:i+window+1].max():
+                    swing_highs.append({'index': i, 'price': df['high'].iloc[i]})
+                
+                # Swing low
+                if df['low'].iloc[i] == df['low'].iloc[i-window:i+window+1].min():
+                    swing_lows.append({'index': i, 'price': df['low'].iloc[i]})
+            
+            if len(swing_highs) < 2 or len(swing_lows) < 2:
+                return {
+                    'structure': 'UNKNOWN',
+                    'bos_detected': False,
+                    'choch_detected': False
+                }
+            
+            # Determine prevailing trend from swing points
+            recent_highs = swing_highs[-3:]
+            recent_lows = swing_lows[-3:]
+            
+            higher_highs = all(recent_highs[i]['price'] > recent_highs[i-1]['price'] 
+                              for i in range(1, len(recent_highs)))
+            higher_lows = all(recent_lows[i]['price'] > recent_lows[i-1]['price'] 
+                             for i in range(1, len(recent_lows)))
+            lower_highs = all(recent_highs[i]['price'] < recent_highs[i-1]['price'] 
+                             for i in range(1, len(recent_highs)))
+            lower_lows = all(recent_lows[i]['price'] < recent_lows[i-1]['price'] 
+                            for i in range(1, len(recent_lows)))
+            
+            # Determine structure
+            if higher_highs and higher_lows:
+                structure = 'BULLISH'
+            elif lower_highs and lower_lows:
+                structure = 'BEARISH'
+            else:
+                structure = 'RANGING'
+            
+            # Check for BOS (Break of Structure)
+            current_price = df['close'].iloc[-1]
+            last_swing_high = swing_highs[-1]['price']
+            last_swing_low = swing_lows[-1]['price']
+            
+            bos_bullish = current_price > last_swing_high
+            bos_bearish = current_price < last_swing_low
+            bos_detected = bos_bullish or bos_bearish
+            
+            # Check for CHoCH (Change of Character)
+            choch_detected = False
+            if structure == 'BEARISH' and bos_bullish:
+                choch_detected = True
+                structure = 'BULLISH_REVERSAL'
+            elif structure == 'BULLISH' and bos_bearish:
+                choch_detected = True
+                structure = 'BEARISH_REVERSAL'
+            
+            return {
+                'structure': structure,
+                'bos_detected': bos_detected,
+                'bos_direction': 'BULLISH' if bos_bullish else 'BEARISH' if bos_bearish else 'NONE',
+                'choch_detected': choch_detected,
+                'last_swing_high': last_swing_high,
+                'last_swing_low': last_swing_low,
+                'current_price': current_price,
+                'higher_highs': higher_highs,
+                'higher_lows': higher_lows,
+                'lower_highs': lower_highs,
+                'lower_lows': lower_lows
+            }
+            
+        except Exception as e:
+            log.error(f"Error in market structure analysis: {e}")
+            return {
+                'structure': 'ERROR',
+                'bos_detected': False,
+                'choch_detected': False
+            }
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ICT KILL ZONE ANALYSIS
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    def _is_in_kill_zone(self, pair: str = None) -> Dict:
+        """
+        Check if current time is in an ICT Kill Zone (optimal entry window).
+        
+        Kill Zones are specific time windows where institutional activity is highest.
+        """
+        try:
+            from datetime import datetime, timezone
+            
+            current_time = datetime.now(timezone.utc)
+            hour = current_time.hour
+            minute = current_time.minute
+            
+            # Check each kill zone
+            in_kill_zone = False
+            active_zone = None
+            zone_quality = 0
+            
+            for zone_name, (start, end) in self.KILL_ZONES.items():
+                if start <= hour < end:
+                    in_kill_zone = True
+                    active_zone = zone_name
+                    
+                    # Quality based on time into zone (best in first half)
+                    zone_duration = end - start
+                    time_into_zone = hour - start + (minute / 60)
+                    
+                    if time_into_zone < zone_duration / 2:
+                        zone_quality = 1.0  # First half is best
+                    elif time_into_zone < zone_duration * 0.75:
+                        zone_quality = 0.8
+                    else:
+                        zone_quality = 0.5  # End of zone - caution
+                    break
+            
+            # Special boost for overlap
+            if 13 <= hour < 15:
+                zone_quality = 1.0
+                active_zone = 'LONDON_NY_OVERLAP'
+            
+            return {
+                'in_kill_zone': in_kill_zone,
+                'zone': active_zone,
+                'zone_quality': zone_quality,
+                'hour_utc': hour,
+                'recommendation': 'TRADE' if in_kill_zone else 'WAIT_FOR_KILLZONE'
+            }
+            
+        except Exception as e:
+            log.error(f"Error in kill zone analysis: {e}")
+            return {
+                'in_kill_zone': False,
+                'zone': None,
+                'zone_quality': 0,
+                'recommendation': 'ERROR'
+            }
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # LIQUIDITY SWEEP DETECTION
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    def _detect_liquidity_sweep(self, df: pd.DataFrame, direction: str = None) -> Dict:
+        """
+        Detect if a liquidity sweep has occurred.
+        
+        Liquidity Sweep: Price takes out previous high/low then reverses.
+        This is often institutional stop hunting before a move.
+        
+        Args:
+            df: OHLCV DataFrame
+            direction: 'BUY' or 'SELL' - the intended trade direction
+            
+        Returns:
+            Dict with sweep detection results
+        """
+        if df is None or len(df) < self.LIQUIDITY_SWEEP_LOOKBACK:
+            return {
+                'sweep_detected': False,
+                'sweep_type': None,
+                'is_favorable': False
+            }
+        
+        try:
+            lookback = self.LIQUIDITY_SWEEP_LOOKBACK
+            buffer = self.LIQUIDITY_SWEEP_BUFFER
+            
+            # Find recent swing highs/lows
+            recent_high = df['high'].iloc[-lookback:-3].max()
+            recent_low = df['low'].iloc[-lookback:-3].min()
+            
+            # Current candle and previous 2 candles
+            current_high = df['high'].iloc[-1]
+            current_low = df['low'].iloc[-1]
+            current_close = df['close'].iloc[-1]
+            
+            prev_high = df['high'].iloc[-3:].max()
+            prev_low = df['low'].iloc[-3:].min()
+            
+            # Detect bullish sweep (took out lows then reversed up)
+            bullish_sweep = (
+                prev_low < recent_low - buffer and  # Swept below previous low
+                current_close > recent_low  # But closed back above
+            )
+            
+            # Detect bearish sweep (took out highs then reversed down)
+            bearish_sweep = (
+                prev_high > recent_high + buffer and  # Swept above previous high
+                current_close < recent_high  # But closed back below
+            )
+            
+            sweep_detected = bullish_sweep or bearish_sweep
+            sweep_type = 'BULLISH' if bullish_sweep else 'BEARISH' if bearish_sweep else None
+            
+            # Determine if sweep is favorable for trade direction
+            is_favorable = False
+            if direction == 'BUY' and bullish_sweep:
+                is_favorable = True  # Sweep down then up - perfect for BUY
+            elif direction == 'SELL' and bearish_sweep:
+                is_favorable = True  # Sweep up then down - perfect for SELL
+            
+            return {
+                'sweep_detected': sweep_detected,
+                'sweep_type': sweep_type,
+                'is_favorable': is_favorable,
+                'recent_high': recent_high,
+                'recent_low': recent_low,
+                'current_close': current_close,
+                'recommendation': 'ENTER_NOW' if is_favorable else 'WAIT' if sweep_detected else 'NO_SWEEP'
+            }
+            
+        except Exception as e:
+            log.error(f"Error in liquidity sweep detection: {e}")
+            return {
+                'sweep_detected': False,
+                'sweep_type': None,
+                'is_favorable': False
+            }
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # MULTIPLE TAKE PROFIT LEVELS
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    def calculate_multiple_tps(self, entry_price: float, stop_loss: float, 
+                                direction: str, atr: float = None) -> Dict:
+        """
+        Calculate multiple take profit levels for professional money management.
+        
+        TP1: 1:1 R:R - Close 50% (secure profits)
+        TP2: 2:1 R:R - Close 30% (let winners run)
+        TP3: 3:1 R:R - Close 20% (final target)
+        
+        Args:
+            entry_price: Entry price
+            stop_loss: Stop loss price
+            direction: 'BUY' or 'SELL'
+            atr: Optional ATR for trail stop calculation
+            
+        Returns:
+            Dict with TP levels and trail stop info
+        """
+        risk = abs(entry_price - stop_loss)
+        
+        if risk <= 0:
+            return {'error': 'Invalid risk (SL equals entry)'}
+        
+        tps = {}
+        
+        for tp_name, tp_config in self.MULTIPLE_TPS.items():
+            ratio = tp_config['ratio']
+            close_pct = tp_config['close_percent']
+            
+            if direction == 'BUY':
+                tp_price = entry_price + (risk * ratio)
+            else:  # SELL
+                tp_price = entry_price - (risk * ratio)
+            
+            tps[tp_name] = {
+                'price': round(tp_price, 5),
+                'ratio': ratio,
+                'close_percent': close_pct,
+                'profit_pips': abs(tp_price - entry_price) * 10000  # For 4-decimal pairs
+            }
+        
+        # Trail stop info
+        trail_stop = None
+        if self.TRAIL_STOP_AFTER_TP1 and atr:
+            if direction == 'BUY':
+                trail_stop = entry_price + (atr * self.TRAIL_STOP_ATR_MULTIPLIER)
+            else:
+                trail_stop = entry_price - (atr * self.TRAIL_STOP_ATR_MULTIPLIER)
+        
+        return {
+            'entry_price': entry_price,
+            'stop_loss': stop_loss,
+            'risk': risk,
+            'direction': direction,
+            'take_profits': tps,
+            'trail_stop': {
+                'activate_after': 'TP1',
+                'move_to_breakeven': True,
+                'trail_price': round(trail_stop, 5) if trail_stop else None,
+                'trail_atr_multiplier': self.TRAIL_STOP_ATR_MULTIPLIER
+            }
+        }
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ENHANCED ENTRY VALIDATION (COMBINES ALL FILTERS)
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    def validate_entry(self, pair: str, df: pd.DataFrame, 
+                       direction: str, entry_price: float, 
+                       stop_loss: float) -> Dict:
+        """
+        Comprehensive entry validation using ALL filters.
+        
+        Checks:
+        1. Kill Zone (optimal trading time)
+        2. Liquidity Sweep (favorable sweep)
+        3. Order Flow confirmation
+        4. Session suitability
+        5. Market structure alignment
+        
+        Returns:
+            Dict with overall validation result
+        """
+        validation_result = {
+            'pair': pair,
+            'direction': direction,
+            'validated': False,
+            'score': 0,
+            'max_score': 5,
+            'checks': {},
+            'recommendation': 'DO_NOT_TRADE'
+        }
+        
+        try:
+            score = 0
+            
+            # 1. Kill Zone Check
+            kill_zone = self._is_in_kill_zone(pair)
+            validation_result['checks']['kill_zone'] = kill_zone
+            if kill_zone.get('in_kill_zone'):
+                score += 1
+            
+            # 2. Liquidity Sweep Check
+            liquidity_sweep = self._detect_liquidity_sweep(df, direction)
+            validation_result['checks']['liquidity_sweep'] = liquidity_sweep
+            if liquidity_sweep.get('is_favorable'):
+                score += 1
+            
+            # 3. Order Flow Check
+            if self.orderflow and df is not None and len(df) >= 50:
+                of_result = self.orderflow.get_confirmation(direction, df)
+                validation_result['checks']['orderflow'] = of_result
+                if of_result.get('status') in ['CONFIRM', 'STRONG_CONFIRM']:
+                    score += 1
+            
+            # 4. Session Check
+            session = self._analyze_session_suitability(pair)
+            validation_result['checks']['session'] = session
+            if session.get('is_optimal'):
+                score += 1
+            
+            # 5. Market Structure Check
+            structure = self._analyze_market_structure(df)
+            validation_result['checks']['market_structure'] = structure
+            if (direction == 'BUY' and structure.get('structure') in ['BULLISH', 'BULLISH_REVERSAL']) or \
+               (direction == 'SELL' and structure.get('structure') in ['BEARISH', 'BEARISH_REVERSAL']):
+                score += 1
+            
+            # Calculate final result
+            validation_result['score'] = score
+            validation_result['validated'] = score >= 3  # Need 3/5 checks
+            
+            if score >= 4:
+                validation_result['recommendation'] = 'STRONG_ENTRY'
+            elif score >= 3:
+                validation_result['recommendation'] = 'ENTRY_OK'
+            elif score >= 2:
+                validation_result['recommendation'] = 'CAUTION'
+            else:
+                validation_result['recommendation'] = 'DO_NOT_TRADE'
+            
+            # Calculate multiple TPs if validated
+            if validation_result['validated']:
+                atr = None
+                if 'atr' in df.columns:
+                    atr = df['atr'].iloc[-1]
+                elif len(df) >= 14:
+                    atr = (df['high'] - df['low']).rolling(14).mean().iloc[-1]
+                
+                validation_result['take_profits'] = self.calculate_multiple_tps(
+                    entry_price, stop_loss, direction, atr
+                )
+            
+            log.info(f"Entry validation for {pair} {direction}: Score {score}/5 - {validation_result['recommendation']}")
+            return validation_result
+            
+        except Exception as e:
+            log.error(f"Error in entry validation: {e}")
+            validation_result['error'] = str(e)
+            return validation_result
     
     def _create_empty_analysis(self, pair: str, timeframe: TimeFrames) -> Dict:
         """

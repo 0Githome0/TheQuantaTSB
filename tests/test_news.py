@@ -1,6 +1,9 @@
 import asyncio
 import logging
-from advanced_analysis import AdvancedAnalysis
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from src.core.advanced_analysis import AdvancedAnalysis
 
 # Configure logging
 logging.basicConfig(
